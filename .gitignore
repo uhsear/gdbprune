@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Connection files carry credentials. Never commit one.
+*.sde
+
+logs/
+*.log
+.env
+*.env
+credentials*
+*token*
