@@ -6,6 +6,9 @@ venv/
 # Connection files carry credentials. Never commit one.
 *.sde
 
+# Version snapshots name database owners. Keep them out of the repo.
+*.json
+
 logs/
 *.log
 .env
