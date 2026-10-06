@@ -468,3 +468,5 @@ Other single-file tools in this portfolio that pair with this one:
   published service holds a lock on a version.
 - [taskpulse](https://github.com/uhsear/taskpulse) - reports which Windows scheduled tasks are
   silently failing. A scheduled gdbprune that exits `1` or `2` is one of them.
+- [compressfloor](https://github.com/uhsear/compressfloor) - names what still holds the compress floor after the
+  prune: a detached or stalled replica, a pinned version, or an orphaned state.
