@@ -67,8 +67,10 @@ CONFIG PRECEDENCE (same order is stated in the README)
 
 SAFETY
     Without --apply the tool prints the plan, deleting nothing and
-    writing nothing. A version that a registered replica uses is never a
-    candidate. Replica system versions (SYNC_SEND..., SYNC_RECEIVE...) are
+    writing nothing. A version that arcpy.da.ListReplicas names as a
+    registered replica's version is never a candidate. The guard sees only
+    the replicas that list returns to the connecting account. Replica
+    system versions (SYNC_SEND..., SYNC_RECEIVE...) are
     never candidates, whatever the pattern, unless --allow-replica-anchors
     is given. Flags cannot be abbreviated.
 
@@ -393,9 +395,12 @@ def count_undated(versions, matcher, only_versions=None, allow_anchors=False):
 
 def count_anchors(versions, matcher, only_versions=None):
     """How many replica anchors match the pattern and the scope: the
-    versions the anchor guard holds back, or releases under the flag."""
+    versions the anchor guard holds back, or releases under the flag. An
+    anchor that a registered replica uses is left to count_replicas(), since
+    the flag cannot release it."""
     only_upper = _scope(only_versions)
-    return sum(1 for v in versions if is_replica_anchor(v) and _matches(v, matcher, only_upper))
+    return sum(1 for v in versions
+               if is_replica_anchor(v) and _eligible(v, matcher, only_upper, True))
 
 
 def count_replicas(versions, matcher, only_versions=None):
@@ -767,11 +772,13 @@ def fetch_versions(workspace):
     elif not isinstance(rows[0], (list, tuple)):
         rows = [rows]
 
-    # The version each registered replica uses: geodatabase replicas and,
-    # with all_replicas True, replicas that a sync-enabled feature service
-    # made for an offline map or a collaboration. Read on every re-read,
-    # before any delete. An error here stops the run: a run that cannot tell
-    # which versions replicas use must not delete any.
+    # The version each registered replica uses. Esri returns a feature
+    # service replica on traditionally versioned data, such as an offline
+    # map's, as a Replica even with all_replicas False; True adds the
+    # SyncReplica objects (branch versioned or nonversioned data), so the
+    # guard reads the widest list Esri offers. Read on every re-read, before
+    # any delete. An error here stops the run: a run that cannot tell which
+    # versions replicas use must not delete any.
     in_use = {node_key(r.version) for r in arcpy.da.ListReplicas(workspace, True)}
 
     versions = []
@@ -1029,10 +1036,9 @@ class _FakeGdb(object):
     re-read after an applied pass sees the smaller tree, as a database would.
     """
 
-    def __init__(self, rows, exists=True, locked=(), replicas=(), sync_replicas=()):
+    def __init__(self, rows, exists=True, locked=(), replicas=()):
         self.rows = [list(r) for r in rows]
         self.replicas = replicas
-        self.sync_replicas = list(sync_replicas)
         self.sql = []
         self.deleted = []
         self.answer = lambda: [list(r) for r in self.rows]
@@ -1060,13 +1066,14 @@ class _FakeGdb(object):
         self.module.management = types.SimpleNamespace(DeleteVersion=delete_version)
 
         def list_replicas(workspace, all_replicas=False):
-            # Only the all-replicas call sees feature service replicas, as
-            # Esri documents; a reader that drops the flag misses them.
+            # Replica objects, which Esri returns whatever all_replicas says:
+            # geodatabase replicas and feature service replicas on
+            # traditionally versioned data. The call is recorded so that the
+            # self-test can pin all_replicas=True.
             gdb.sql.append(("replicas", all_replicas))
             if isinstance(gdb.replicas, Exception):
                 raise gdb.replicas
-            names = list(gdb.replicas) + (gdb.sync_replicas if all_replicas else [])
-            return [types.SimpleNamespace(version=v) for v in names]
+            return [types.SimpleNamespace(version=v) for v in gdb.replicas]
 
         self.module.da = types.SimpleNamespace(ListReplicas=list_replicas)
 
@@ -2501,6 +2508,17 @@ def self_test():
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_01"],
               "a live --apply deletes no anchor without the flag  <-- pinned defect")
         gdb = _FakeGdb(anchor_rows)
+        code, out = _run_cli(["--workspace", "conn", "--allow-replica-anchors"], gdb.module)
+        check(code == 0 and gdb.deleted == [] and "sde.SYNC_SEND_7_0" in out,
+              "a live plan with --allow-replica-anchors and no --apply deletes nothing"
+              "  <-- pinned defect")
+        gdb = _FakeGdb(anchor_rows, replicas=["SYNC_RECEIVE_7_2"])
+        code, out = _run_cli(["--workspace", "conn", "--allow-replica-anchors"], gdb.module)
+        check(code == 0 and "ALLOWED by --allow-replica-anchors; 2 matching" in out
+              and "replica in use : 1 matching" in out and "SYNC_RECEIVE_7_2" not in out,
+              "an anchor a replica uses is counted as in use, not as one the flag can prune"
+              "  <-- pinned defect")
+        gdb = _FakeGdb(anchor_rows)
         code, out = _run_cli(["--workspace", "conn", "--apply", "--allow-replica-anchors"],
                              gdb.module)
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_01", "sde.SYNC_RECEIVE_7_2",
@@ -2534,8 +2552,8 @@ def self_test():
                        ["SYNC_FIELD_02", "DEFAULT", "gisowner", "2025-01-01 00:00:00"]]
 
         def in_use_gdb():
-            return _FakeGdb(in_use_rows, replicas=["GISOWNER.SYNC_EDIT_9"],
-                            sync_replicas=[fs_name, "sde.Esri_Anonymous_WaterSync"])
+            return _FakeGdb(in_use_rows, replicas=["GISOWNER.SYNC_EDIT_9", fs_name,
+                                                   "sde.Esri_Anonymous_WaterSync"])
 
         gdb = in_use_gdb()
         code, out = _run_cli(["--workspace", "conn", "--apply", "--allow-replica-anchors"],
@@ -2565,7 +2583,7 @@ def self_test():
               and "replica in use : 3 matching" in out,
               "a plan from the export holds back the replica versions too  <-- pinned defect")
         gdb = _FakeGdb(undated_anchor_rows + in_use_rows[2:3],
-                       sync_replicas=["sde.Esri_Anonymous_WaterSync"])
+                       replicas=["sde.Esri_Anonymous_WaterSync"])
         code, out = _run_cli(["--export-versions", os.path.join(tmp, "ua.json"), "--workspace",
                               "conn"], gdb.module)
         check(code == 0 and "undated        : 2 version(s) matching" in out,

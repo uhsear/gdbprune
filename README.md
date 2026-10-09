@@ -13,13 +13,13 @@ version that still has a child. The script either stops halfway or swallows the 
 on. Either way the parents stay, and the next night adds another layer on top of them. The same
 pattern also matches versions that replication still uses. Esri says not to delete the
 `SYNC_SEND` and `SYNC_RECEIVE` versions by hand. An offline map's replica version is named
-after the user and the feature service, so a service named `FieldSync` gives one that matches.
-That version stays in use while the map is downloaded.
+after the user and the feature service, so a service named `FieldSync` can give one that
+matches. That version stays in use while the map is downloaded.
 
 gdbprune deletes only the versions that are leaves right now, re-reads the version table, and
-repeats until a pass finds nothing. It never deletes a version that a registered replica uses,
-or a replica system version unless you name a flag. Without `--apply` it prints the plan and
-deletes nothing.
+repeats until a pass finds nothing. It never deletes a version that `arcpy.da.ListReplicas`
+names as a registered replica's version. It never deletes a `SYNC_SEND` or `SYNC_RECEIVE`
+version unless you name a flag. Without `--apply` it prints the plan and deletes nothing.
 
 **Who this is for.** A paid ArcGIS Enterprise install, a **traditionally-versioned**
 geodatabase, and an admin `.sde` connection file. Branch-versioned shops get nothing
@@ -41,9 +41,10 @@ somebody wants, use that tool with the settings in [Reconcile order](#reconcile-
 gdbprune is for versions whose edits you have already decided to throw away.
 
 **Versions that replication uses are held back.** A live run asks `arcpy.da.ListReplicas` for
-every replica in the geodatabase, including the replicas that sync-enabled feature services
-make for offline maps. A version that one of them uses is never a candidate, and no flag
-changes that. The default `%SYNC%` pattern also matches the `SYNC_SEND` and `SYNC_RECEIVE`
+every replica it can see, including the replicas that sync-enabled feature services make for
+offline maps. A version that one of them uses is never a candidate, and no flag changes that.
+The guard is only as complete as the list that `ListReplicas` returns to the connecting
+account. The default `%SYNC%` pattern also matches the `SYNC_SEND` and `SYNC_RECEIVE`
 replica system versions. gdbprune never makes one of those a candidate unless you pass
 `--allow-replica-anchors`. See [Versions that replication uses](#versions-that-replication-uses).
 
@@ -142,6 +143,8 @@ PASS  an --apply whose replica re-list fails exits 1 and names what it deleted  
 PASS  an --apply whose report cannot be written exits 1 and counts its deletes on stderr  <-- pinned defect
 ...
 PASS  a live --apply deletes no anchor without the flag  <-- pinned defect
+PASS  a live plan with --allow-replica-anchors and no --apply deletes nothing  <-- pinned defect
+PASS  an anchor a replica uses is counted as in use, not as one the flag can prune  <-- pinned defect
 ...
 PASS  a live --apply deletes no version an offline map or a replica uses, even with the flag  <-- pinned defect
 PASS  a run that cannot list the replicas deletes nothing and exits 1  <-- pinned defect
@@ -157,10 +160,10 @@ PASS  the self-test writes no bytecode cache next to the script  <-- pinned defe
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it
 ------------------------------------------------------------------
-319 assertions, 0 failed
+321 assertions, 0 failed
 ```
 
-The full run prints all 319 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 321 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -187,12 +190,12 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 319 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
+The same 321 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
 Ubuntu the same count also passes under six `TZ` settings, from UTC-11 to UTC+14, because the
 time-zone assertions use an offset that no zone uses. One assertion writes through a dangling
 symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
-it prints a `SKIP` line instead, and the count is 318.
+it prints a `SKIP` line instead, and the count is 320.
 
 ## Usage
 
@@ -461,12 +464,16 @@ Given a synthetic snapshot that holds `gisowner.crew_FieldSync_1404578882000`, 1
 for deletion.
 
 gdbprune 1.3.0 does not guess from the name. Each time it reads the version table, it also
-calls `arcpy.da.ListReplicas(workspace, True)`, before any delete. With `True` the list also
-holds `SyncReplica` objects, which Esri describes as "a replica created through a sync-enabled
-feature service". A geodatabase `Replica`'s `version` property is "The version from which the
-replica was created (replica version)." For a `SyncReplica`, Esri describes `version` only as
-"The version from which the replica was created". gdbprune reads it as the per-map replica
-version, as the self-test's stand-in arcpy does; Limitation 12 says why that is unverified.
+calls `arcpy.da.ListReplicas(workspace, True)`, before any delete. Esri's
+[ListReplicas](https://doc.esri.com/en/arcgis-pro/latest/arcpy/data-access/listreplicas.html)
+page says that the default call returns "Only Replica objects", and that these "include
+replicas created from geodatabase replication workflows as well as replicas created from
+feature services running on traditional versioned data". So an offline map on the data that
+gdbprune serves comes back as a `Replica`. Its `version` property is "The version from which the
+replica was created (replica version)." With `True` the list can also hold `SyncReplica`
+objects. Esri's `SyncReplica` page says that those include replicas "created from nonversioned
+data with archiving or from branch versioned data", so they are not expected to name a
+traditional version. gdbprune passes `True` only so that the guard reads the widest list.
 gdbprune marks every version named there, compared by unqualified
 name in any letter case. A marked version is never a candidate, whatever `--prune-pattern`,
 `--only-versions` or `--allow-replica-anchors` says. It stays in the tree, so it still pins its
@@ -480,13 +487,13 @@ To delete such a version, unregister its replica first. The version then drops o
 For distributed collaboration, the same Esri page says that "no replica version is created when
 data is copied during distributed collaboration workflows".
 
-The self-test pins this through the stand-in arcpy. It registers
-`gisowner.crew_FieldSync_1404578882000` and `sde.Esri_Anonymous_WaterSync` as feature service
-replicas, and `SYNC_EDIT_9` as a geodatabase replica. A live `--apply` with
-`--allow-replica-anchors` then deletes only the one ordinary version. The stand-in returns the
-feature service replicas only when it is called with `True`, so a reader that drops the
-argument fails the test. A `ListReplicas` that raises on the first read makes the run delete
-nothing and exit `1`. One that raises on the re-read after pass 1 makes it print `STOPPED`, name
+The self-test pins this through the stand-in arcpy. Its `ListReplicas` returns
+`gisowner.crew_FieldSync_1404578882000` and `sde.Esri_Anonymous_WaterSync`, named like two
+offline maps' replica versions, and `SYNC_EDIT_9`, a geodatabase replica's version. A live
+`--apply` with `--allow-replica-anchors` then deletes only the one ordinary version. The
+stand-in records the `all_replicas` argument, and the test asserts that it was `True`, so a
+reader that drops the argument fails the test. A `ListReplicas` that raises on the first read
+makes the run delete nothing and exit `1`. One that raises on the re-read after pass 1 makes it print `STOPPED`, name
 the version it deleted, and exit `1`.
 
 ### Replica system versions
@@ -518,7 +525,8 @@ version is never a candidate unless `--allow-replica-anchors` is given. That is 
 `--only-versions`. A held-back anchor stays in the tree, so it still pins its parent. In `LIKE`,
 `_` matches any one character, so a look-alike such as `SYNCXSEND_1` is held back too. The
 plan prints the count of matching anchors it held back on the `replica anchors` line, and the
-two `NOT LIKE` clauses in the candidate rule.
+two `NOT LIKE` clauses in the candidate rule. An anchor that a registered replica also uses is
+counted on the `replica in use` line instead, because the flag cannot release it.
 
 The self-test pins this on a synthetic chain of three `SYNC_SEND_7_*` versions, a
 `SYNC_RECEIVE_7_3`, an owner-qualified lower-case `gisowner.sync_send_9_1` and one ordinary
@@ -528,23 +536,29 @@ database to delete only `SYNC_FIELD_01`. A live `--apply` through the stand-in a
 anchor without the flag, and with it deletes them leaf first.
 
 Release an anchor only after its replica is gone. Esri's article says these versions are
-deleted when the replica is unregistered.
+deleted when the replica is unregistered. That did not always happen. Esri bug
+[NIM057605](https://support.esri.com/en-us/bug/syncreceive-versions-are-adding-up-in-sdesdeversions-ta-nim057605),
+found in 9.3 and fixed in 10.1, gives a workaround that deletes `SYNC_SEND_9_2`, "which was
+orphaned due to unregistering the replica", and then compresses. Such an orphan is what
+`--allow-replica-anchors` is for. First confirm with `ListReplicas` that no replica remains.
+Then name the orphan in `--only-versions` and pass the flag.
 
 ## Reconcile order
 
 gdbprune throws edits away. When the edits in some stale versions must survive, reconcile and
 post those versions first, then prune what is left. The settings below come from Esri's
-[Reconcile Versions](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/reconcile-versions.htm)
+[Reconcile Versions](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/reconcile-versions.html)
 tool reference and the
 [RecommendedReconcileOrder](https://desktop.arcgis.com/en/arcobjects/10.7/net/IVersionedWorkspace2_RecommendedReconcileOrder.htm)
 reference. They were not run against a geodatabase for this README.
 
 1. Reconcile every version whose edits must survive. The default
-   `reconcile_mode="ALL_VERSIONS"` reconciles every edit version with the target.
-   `BLOCKING_VERSIONS` reconciles only the "Versions that are blocking the target version from
-   compressing", in the recommended reconcile order. That order sorts versions by their common
-   ancestor state with `DEFAULT`, so each reconcile lets a later compress move more rows
-   (ArcObjects `IVersionedWorkspace2.RecommendedReconcileOrder`). It leaves out a version that
+   `reconcile_mode="ALL_VERSIONS"` reconciles each version that you list in `edit_versions`
+   with the target. `BLOCKING_VERSIONS` reconciles only the "Versions that are blocking the
+   target version from compressing", and the tool page says "This option uses the recommended
+   reconcile order." That page does not describe the order. The ArcObjects reference
+   `IVersionedWorkspace2.RecommendedReconcileOrder` sorts versions by their common ancestor
+   state with `DEFAULT`, so each reconcile lets a later compress move more rows. It leaves out a version that
    does not block a compress, and such a version can still hold unposted edits. Use
    `BLOCKING_VERSIONS` to free the compress, not to keep edits.
 2. Do not rely on the defaults to keep conflicting edits. For traditional versioning
@@ -662,6 +676,8 @@ Real refusals, not a wishlist.
       such as U+017F (long s) matches `S`.
     - The anchor test uses the upper-cased last dotted part of the name. A look-alike such as
       `SYNCXSEND_1` is held back, but a bracketed name such as `[SYNC_SEND_1]` is not.
+    - A version name that holds a dot, such as `SYNC_SEND_1.bak`, is tested as `BAK`, so it is
+      not held back. The printed rule `NOT LIKE 'SYNC_SEND%'` says that it is excluded.
     - An owner that holds a dot but no backslash, such as `first.last`, is not quoted.
       `DeleteVersion` then receives `first.last.SYNC_A` and is likely to refuse it.
     - With `--allow-replica-anchors`, a partial run deletes the newest anchors first and leaves
@@ -688,10 +704,15 @@ Real refusals, not a wishlist.
       and can be pruned up to that many hours early.
     - The cutoff is the local wall clock minus N days, so a run across a daylight-saving
       change can move the boundary by one hour.
-    - For a feature service replica, gdbprune assumes that `SyncReplica.version` names the
-      per-map replica version. If a real geodatabase returns the published parent version
-      there, the per-map version is not held back. No geodatabase with an offline map was
-      available to check this.
+    - For traditionally versioned data, Esri returns feature service replicas as `Replica`
+      objects, whose `version` is the replica version. This was not checked on a geodatabase
+      that holds an offline map.
+    - Esri truncates an offline map's replica version name to 30 characters, cutting the
+      feature service part of the name. So whether `%SYNC%` matches such a version depends on
+      the user name. gdbprune holds it back because `ListReplicas` names it, not because of
+      its name.
+    - A replica registered after a pass reads the version table, but before that pass
+      deletes, is not seen until the next read. Its version can be deleted in that pass.
     - After an offline map is removed and its replica is unregistered, its replica version can
       still hold synced edits that were never posted. The default `%SYNC%` pattern then
       matches it like any other version, for example in a service named `FieldSync`.
@@ -703,6 +724,8 @@ Real refusals, not a wishlist.
       collaboration was run for this release.
     - Esri does not say whether `ListReplicas` returns replicas that other accounts own.
       Connect as the geodatabase administrator, so that the replica guard sees every replica.
+      The guard is only as complete as that list, and it was not checked against an
+      enterprise geodatabase.
     - An anchor name with a prefix, such as `REP_SYNC_SEND_1`, is not held back, because the
       anchor patterns match from the start of the name.
     - `--allow-replica-anchors` does not check whether an anchor's replica is still
