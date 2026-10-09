@@ -1277,6 +1277,9 @@ def self_test():
           and _coerce_datetime("2025-01-02T03:04:05.25") == datetime(2025, 1, 2, 3, 4, 5, 250000),
           "a seven-digit fraction rounds up to the microsecond, never toward deletion"
           "  <-- pinned defect")
+    check(_coerce_datetime("2025-01-02 03:04:05.12345678") is None
+          and _coerce_datetime("2025-01-02 03:04:05.123456789") is None,
+          "a text time with eight or nine fraction digits is unknown, never pruned")
     check(_coerce_datetime("2025-02-30") is None
           and _coerce_datetime("9999-12-31 23:59:59.9999999") is None,
           "a text date that does not exist or leaves the datetime range is unknown")
@@ -1307,6 +1310,8 @@ def self_test():
           "a quoted parent pins its unquoted parent  <-- pinned defect")
     check(qual_case(_v("SYNC_P", parent="DEFAULT"), '"gisowner"."sync_p"') == [],
           "a quoted, qualified, lower-case parent still pins its parent")
+    check(qual_case(_v("SYNC_P", parent="DEFAULT"), '"CORP\\jane.doe".SYNC_P') == [],
+          "a parent whose owner holds a dot still pins its parent")
     check(qual_case(_v("SYNC_P", parent="DEFAULT"), "SYNC_OTHER") == ["gisowner.SYNC_P"],
           "a parent named by nobody is still a leaf")
     check(node_key(' "sde"."DEFAULT" ') == "DEFAULT" and node_key(None) == "",
@@ -1531,6 +1536,7 @@ def self_test():
           "a held-back anchor still pins its parent")
     check(is_replica_anchor({"name": '"sde"."sync_receive_4_2"'})
           and is_replica_anchor({"name": "SYNCXSEND_1"})
+          and is_replica_anchor({"name": "SYNC_RECEIVE_REC_12_3"})
           and not is_replica_anchor({"name": "SYNC_SENT_1"})
           and not is_replica_anchor({"name": "MY_SYNC_SEND_1"})
           and not is_replica_anchor({"name": None}),
@@ -2457,6 +2463,22 @@ def self_test():
         check(os.path.getsize(sink_path) == 0,
               "a stdout that failed is pointed at the null device")
 
+        # A buffered stdout fails at the flush, not at the write. main()
+        # flushes inside its handlers, so the run exits 2, not 120 at exit.
+        class _FlushFails(io.StringIO):
+            def flush(self):
+                raise OSError(28, "No space left on device")
+
+        late, err = _FlushFails(), io.StringIO()
+        saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = late, err
+        try:
+            code = main(["--from-versions", snap_path])
+        finally:
+            sys.stdout, sys.stderr = saved
+        check(code == 2 and "error: OSError" in err.getvalue(),
+              "a --from-versions plan whose stdout cannot be flushed exits 2")
+
         # fetch_versions: the shapes ArcSDESQLExecute can hand back
         def fetched(answer):
             gdb = _FakeGdb([])
@@ -2651,16 +2673,22 @@ def self_test():
         sys.stdout = quiet
     probe_failed = failed[mark:]
     del failed[mark:]
-    check(len(probe_failed) == 6,
-          "check(), raises() and refuses() really do record a failure  <-- pinned defect")
+    label = "check(), raises() and refuses() really do record a failure  <-- pinned defect"
+    check(len(probe_failed) == 6, label)
+    # The verdict cannot rest on check() alone: a check() that never records
+    # a failure would pass its own probe. A short probe is a failure here.
+    failed.extend([] if len(probe_failed) == 6 else ["%s (probe recorded %d of 6)"
+                                                     % (label, len(probe_failed))])
     check(_footer(3, ["x"]) == (1, ["3 assertions, 1 failed", "  FAILED: x"]),
-          "a failed assertion makes the self-test exit 1 and names it")
+          "a failed assertion makes the self-test exit 1 and names it  <-- pinned defect")
 
     print("-" * 66)
     code, lines = _footer(passed[0] + len(failed), failed)
     for line in lines:
         print(line)
-    return code
+    # The exit code is taken from failed too, so a _footer() that always
+    # returned 0 cannot turn a red run green.
+    return 1 if failed else code
 
 
 def _versions_from_rows(rows):
