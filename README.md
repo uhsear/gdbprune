@@ -116,6 +116,7 @@ PASS  an exported snapshot plans exactly what the live dry run plans
 PASS  an export to the workspace's own connection string is refused, and no file is named after it  <-- pinned defect
 PASS  the export and snapshot paths print redacted like the workspace  <-- pinned defect
 ...
+PASS  a KEY=value field quoted from an invalid snapshot is masked  <-- pinned defect
 PASS  argparse's usage error redacts a connection string it echoes  <-- pinned defect
 ...
 PASS  an export of a True query result is refused, not written as an empty table  <-- pinned defect
@@ -160,10 +161,10 @@ PASS  the self-test writes no bytecode cache next to the script  <-- pinned defe
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-324 assertions, 0 failed
+325 assertions, 0 failed
 ```
 
-The full run prints all 324 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 325 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -190,12 +191,12 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 324 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
+The same 325 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
 Ubuntu the same count also passes under six `TZ` settings, from UTC-11 to UTC+14, because the
 time-zone assertions use an offset that no zone uses. One assertion writes through a dangling
 symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
-it prints a `SKIP` line instead, and the count is 323. Branch coverage excludes that `SKIP`
+it prints a `SKIP` line instead, and the count is 324. Branch coverage excludes that `SKIP`
 branch with a `pragma: no cover` comment, because a host that can create the link never runs it.
 
 The harness checks itself. A probe feeds six known failures through `check()`, `raises()` and
@@ -303,7 +304,7 @@ Exit codes:
 | Code | Live plan and `--apply` | `--from-versions` and `--export-versions` |
 |---|---|---|
 | `0` | The run finished its work. | The plan finished, or the export ran. |
-| `1` | The run left work, or could not run. See below. | The plan stopped at the pass limit, or a matching version has no readable creation time. |
+| `1` | The run left work, or could not run. See below. | The plan stopped at the pass limit, or a matching version has no readable creation time. An export exits `0` whenever it ran, undated versions included, and prints their count. |
 | `2` | A usage error that argparse reports. | The command could not run. See below. |
 
 A live run exits `1` in each of these cases. Every refusal that 1.0.0 had keeps the `1` it had
@@ -571,7 +572,8 @@ reference. They were not run against a geodatabase for this README.
    target version from compressing", and the tool page says "This option uses the recommended
    reconcile order." That page does not describe the order. The ArcObjects reference
    `IVersionedWorkspace2.RecommendedReconcileOrder` sorts versions by their common ancestor
-   state with `DEFAULT`, so each reconcile lets a later compress move more rows. It leaves out a version that
+   state with `DEFAULT`. It does not say why. That the order lets a later compress move more
+   rows is inferred, not stated by Esri. It leaves out a version that
    does not block a compress, and such a version can still hold unposted edits. Use
    `BLOCKING_VERSIONS` to free the compress, not to keep edits.
 2. Do not rely on the defaults to keep conflicting edits. For traditional versioning
@@ -729,8 +731,9 @@ Real refusals, not a wishlist.
     - The cutoff is the local wall clock minus N days, so a run across a daylight-saving
       change can move the boundary by one hour.
     - For traditionally versioned data, Esri returns feature service replicas as `Replica`
-      objects, whose `version` is the replica version. This was not checked on a geodatabase
-      that holds an offline map.
+      objects, whose `version` is the replica version. The offline-map guard assumes that
+      `ListReplicas` reports each map's own replica version, not the version that the map was
+      published from. This was not checked on a geodatabase that holds an offline map.
     - Esri truncates an offline map's replica version name to 30 characters, cutting the
       feature service part of the name. So whether `%SYNC%` matches such a version depends on
       the user name. gdbprune holds it back because `ListReplicas` names it, not because of
@@ -780,8 +783,25 @@ Real refusals, not a wishlist.
       A variant such as `"$WS.json"` is not caught, and under `--apply` the file it writes
       has the password in its name.
     - When `--from-versions` or `--export-versions` names an existing JSON file that is not a
-      snapshot, the refusal can quote that file's `format` value. It is masked only where it
-      looks like `KEY=value`.
+      snapshot, the refusal can quote a value from that file, such as its `format`. A quoted
+      value that holds `=`, `@` or `://` hides the whole reason as `(connection string
+      hidden)`. Any other value is printed as it is.
+    - A creation time that the database returns as a date with no time, such as `2025-01-02`,
+      is read as midnight. That version can look up to one day older than it is.
+    - A user version whose name only starts like an anchor, such as `SYNC_SENDOFF` or
+      `SYNC_RECEIVED_FIX`, is held back as a replica anchor. The `replica anchors` count is the
+      only sign of it.
+    - With `--allow-replica-anchors`, the `replica anchors` count includes anchors that are too
+      young or still pinned by a child. It can be larger than the number the plan deletes.
+    - On a stand-in table of 100,000 versions with chains 50 deep, a dry run took about 12
+      seconds of CPU. A live run adds one table read and one `ListReplicas` call per pass.
+    - Only CPython 3.9, 3.12 and 3.13 were run. Python 3.10 and 3.11 are untested.
+    - Other local users can see a connection-string `--workspace` in the process list while
+      the run lasts. Use an `.sde` file or `SDE_MAINTENANCE_WORKSPACE` instead.
+    - If `--export-versions` names a symbolic link to an existing snapshot, the export
+      overwrites the snapshot that the link points to.
+    - If `--from-versions` names a FIFO or a device, the read can block. The reader loads the
+      whole file into memory, however large it is.
 
 ## Contributing
 
