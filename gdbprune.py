@@ -2170,6 +2170,11 @@ def self_test():
             code, out = _run_cli(argv, _FakeGdb(live_rows).module)
             check(code == 2 and needle in out and "hunter2" not in out,
                   "%s is reported with its path redacted  <-- pinned defect" % label)
+        fmt_path = put("fmt.json", '{"format": "PWD=hunter2", "schema_version": 2, '
+                       '"exported_at": "2026-01-01T00:00:00", "versions": []}')
+        code, out = _run_cli(["--from-versions", fmt_path], None)
+        check(code == 2 and "is not a valid gdbprune snapshot" in out and "hunter2" not in out,
+              "a KEY=value field quoted from an invalid snapshot is masked  <-- pinned defect")
         code, out = _run_cli(["--workspce", "SERVER=db-host-01;UID=sde_admin;PWD=hunter2"])
         check(code == 2 and "unrecognized arguments: --workspce SERVER=***;UID=***;PWD=***" in out
               and "hunter2" not in out,
@@ -2799,7 +2804,7 @@ def run_from_versions(args, now, cutoff):
         exported_at, versions = read_snapshot(args.from_versions)
     except SnapshotError as exc:
         raise ToolError("%s is not a valid gdbprune snapshot: %s"
-                         % (redact(args.from_versions), exc))
+                         % (redact(args.from_versions), redact(str(exc))))
     except OSError as exc:
         # A FILE path is redacted like the workspace: "$WS" passed here by
         # mistake is a connection string, and OSError quotes it.
