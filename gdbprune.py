@@ -641,7 +641,7 @@ def parse_snapshot(text):
     # type() is int, not isinstance(): True is an int and True == 1.
     version = doc["schema_version"]
     if type(version) is not int or version != SNAPSHOT_SCHEMA_VERSION:
-        # Schema 1 (gdbprune 1.1.0 and 1.2.0) records no replica versions,
+        # Schema 1 (gdbprune 1.1.0) records no replica versions,
         # so a plan from it could select one. It is refused, not upgraded.
         raise (OldSchemaError if type(version) is int and version == 1 else SnapshotError)(
             "schema_version: expected %d, got %r. Export the table again with this release."
@@ -1802,6 +1802,8 @@ def self_test():
             "a version with no replica flag is refused", "missing field(s): replica")
     refuses(set_top("schema_version", True),
             "schema_version true is refused although True == 1  <-- pinned defect")
+    refuses(set_top("schema_version", 2.0),
+            "schema_version 2.0 is refused although 2.0 == 2  <-- pinned defect")
     refuses(set_top("schema_version", "1"), "a schema_version given as text is refused")
     refuses(set_top("exported_at", None), "a null export time is refused")
     refuses(set_top("exported_at", "2026-01-01 09:30:00"),
@@ -2396,6 +2398,25 @@ def self_test():
               "an --apply whose re-read fails exits 1 and names what it deleted"
               "  <-- pinned defect")
 
+        # The same stop when ListReplicas, not the table query, fails on the re-read.
+        gdb = _FakeGdb(stop_rows)
+        first_list = gdb.module.da.ListReplicas
+        list_calls = [0]
+
+        def relist_fails(workspace, all_replicas=False):
+            list_calls[0] += 1
+            if list_calls[0] > 1:
+                raise RuntimeError("ListReplicas failed")
+            return first_list(workspace, all_replicas)
+
+        gdb.module.da.ListReplicas = relist_fails
+        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        check(code == 1 and gdb.deleted == ["gisowner.SYNC_B"]
+              and "STOPPED: re-reading the version table after pass 1 failed" in out
+              and "      gisowner.SYNC_B" in out and "ListReplicas failed" in out,
+              "an --apply whose replica re-list fails exits 1 and names what it deleted"
+              "  <-- pinned defect")
+
         # A stdout that cannot be written after --apply has deleted: exit 1,
         # the count on stderr, and stdout muted so the exit flush cannot fail.
         class _FullStdout(io.StringIO):
@@ -2537,7 +2558,7 @@ def self_test():
               == ["crew_FieldSync_1404578882000", "Esri_Anonymous_WaterSync", "SYNC_EDIT_9"]
               and "undated        : 1 version(s)" in out,
               "the export marks the replica versions, counts an undated one, and replaces a"
-              " 1.2.0 snapshot  <-- pinned defect")
+              " schema 1 snapshot  <-- pinned defect")
         code, out = _run_cli(["--from-versions", in_use_path], None)
         check(code == 0 and pass_lines(out) == ["  pass 1  -  1 leaf version(s)",
                                                 "      gisowner.SYNC_FIELD_02"]
@@ -2665,7 +2686,7 @@ def build_parser():
     p.add_argument(
         "--workspace",
         help="Path to an admin .sde connection file. Required for a live run and for "
-             "--export-versions. Falls back to $%s; the flag wins." % ENV_WORKSPACE,
+             "--export-versions. Falls back to $%s; a non-empty flag wins." % ENV_WORKSPACE,
     )
     p.add_argument(
         "--prune-pattern",
@@ -2784,7 +2805,7 @@ def run_export(args, workspace, now):
             try:
                 read_snapshot(args.export_versions)
             except OldSchemaError:
-                pass  # a 1.1.0 or 1.2.0 snapshot, replaced like any earlier one
+                pass  # a 1.1.0 snapshot, replaced like any earlier one
             except (SnapshotError, OSError) as exc:
                 raise ToolError("%s exists and is not a gdbprune snapshot, so it is not "
                                 "overwritten (%s)"
