@@ -2,17 +2,24 @@
 
 Delete stale leaf versions from a traditionally-versioned Enterprise geodatabase, printing a plan first.
 
-A mobile editing crew syncs every night, and every sync leaves a version behind with `SYNC` in
-its name. Nobody deletes them. Two years later the version table holds hundreds, and each one
-still references database states that a compress cannot remove.
+A nightly script creates an edit version for each field crew, named `SYNC_` and the date. A
+supervisor reviews each one and posts what is wanted. Nobody deletes the versions afterwards.
+Two years later the version table holds hundreds of them, and each one still references
+database states that a compress cannot remove.
 
 So somebody writes the obvious cleanup: select every `SYNC` version older than a week, then
 delete each one. The first parent in that list fails, because the database refuses to drop a
 version that still has a child. The script either stops halfway or swallows the error and moves
-on. Either way the parents stay, and the next night adds another layer on top of them.
+on. Either way the parents stay, and the next night adds another layer on top of them. The same
+pattern also matches versions that replication still uses. Esri says not to delete the
+`SYNC_SEND` and `SYNC_RECEIVE` versions by hand. An offline map's replica version is named
+after the user and the feature service, so a service named `FieldSync` gives one that matches.
+That version stays in use while the map is downloaded.
 
 gdbprune deletes only the versions that are leaves right now, re-reads the version table, and
-repeats until a pass finds nothing. Without `--apply` it prints the plan and deletes nothing.
+repeats until a pass finds nothing. It never deletes a version that a registered replica uses,
+or a replica system version unless you name a flag. Without `--apply` it prints the plan and
+deletes nothing.
 
 **Who this is for.** A paid ArcGIS Enterprise install, a **traditionally-versioned**
 geodatabase, and an admin `.sde` connection file. Branch-versioned shops get nothing
@@ -21,13 +28,28 @@ through a different API. If your data is branch-versioned, stop here.
 
 **The existing alternative.** Esri's own Reconcile Versions tool
 (`arcpy.management.ReconcileVersions`) can post each edit version to its target and then
-delete it, with `with_post="POST"` and `with_delete="DELETE_VERSION"`. That keeps the edits,
-which gdbprune never does. If your stale versions might hold edits somebody wants, use that
-tool. gdbprune is for versions whose edits you have already decided to throw away.
+delete it, with `with_post="POST"` and `with_delete="DELETE_VERSION"`. It does well what
+gdbprune never does: it moves the edits into the target before the version goes. With its
+default settings it does not keep every edit. For traditional versioning the defaults are
+`conflict_resolution="FAVOR_TARGET_VERSION"` and `abort_if_conflicts="NO_ABORT"`. Esri's tool
+page says "All conflicts will be resolved in favor of the target version", and that with
+`NO_ABORT` "The reconcile will not end if conflicts are found." The page does not say what the
+post then does. The likely result is that the target's side of each conflict is posted, and the
+delete removes the version that held the other side. That result is inferred from Esri's
+documentation. It was not run against a geodatabase. If your stale versions might hold edits
+somebody wants, use that tool with the settings in [Reconcile order](#reconcile-order).
+gdbprune is for versions whose edits you have already decided to throw away.
+
+**Versions that replication uses are held back.** A live run asks `arcpy.da.ListReplicas` for
+every replica in the geodatabase, including the replicas that sync-enabled feature services
+make for offline maps. A version that one of them uses is never a candidate, and no flag
+changes that. The default `%SYNC%` pattern also matches the `SYNC_SEND` and `SYNC_RECEIVE`
+replica system versions. gdbprune never makes one of those a candidate unless you pass
+`--allow-replica-anchors`. See [Versions that replication uses](#versions-that-replication-uses).
 
 ```
 $ python gdbprune.py --self-test
-gdbprune 1.1.0 self-test (no arcpy, no network, no credentials)
+gdbprune 1.3.0 self-test (no arcpy, no network, no credentials)
 ------------------------------------------------------------------
 PASS  chain pass 1 selects exactly the leaf SYNC_C
 PASS  chain pass 1 does NOT select SYNC_B (has live child)
@@ -48,13 +70,21 @@ PASS  a child that does not match the pattern still pins its parent  <-- pinned 
 ...
 PASS  an EMPTY --only-versions scopes to nothing, it does not disable scoping  <-- pinned defect
 ...
+PASS  the default %SYNC% pattern never selects a SYNC_SEND or SYNC_RECEIVE anchor  <-- pinned defect
+...
+PASS  a wide-open --apply never asks the database to delete an anchor  <-- pinned defect
+...
+PASS  a version a registered replica uses is never selected, even with the anchor flag  <-- pinned defect
+...
 PASS  a chain exactly max_passes deep that empties on the last pass converges  <-- pinned defect
 ...
 PASS  undated counts the matching, in-scope versions it cannot date, and no others  <-- pinned defect
 ...
 PASS  a re-read that fails after deletes returns them, unconverged, with the error  <-- pinned defect
 ...
-PASS  a field outside the four version fields is never copied into the file  <-- pinned defect
+PASS  a field outside the five version fields is never copied into the file  <-- pinned defect
+...
+PASS  a schema 1 snapshot, which records no replica versions, is refused  <-- pinned defect
 ...
 PASS  schema_version true is refused although True == 1  <-- pinned defect
 ...
@@ -104,19 +134,31 @@ PASS  a live-mode refusal exits 1, as in 1.0.0, not 2  <-- pinned defect
 PASS  an EZConnect or URL workspace is hidden whole  <-- pinned defect
 ...
 PASS  a live run over a query that returned no rows is refused, not planned clean  <-- pinned defect
-PASS  a table of unreadable creation times plans nothing and says 2 are undated  <-- pinned defect
+PASS  a table of unreadable creation times plans nothing, says 2 are undated and exits 1  <-- pinned defect
+PASS  an --apply that could date no matching version exits 1, not 0  <-- pinned defect
 PASS  an --apply whose re-read fails exits 1 and names what it deleted  <-- pinned defect
 PASS  an --apply whose report cannot be written exits 1 and counts its deletes on stderr  <-- pinned defect
+...
+PASS  a live --apply deletes no anchor without the flag  <-- pinned defect
+...
+PASS  a live --apply deletes no version an offline map or a replica uses, even with the flag  <-- pinned defect
+PASS  a run that cannot list the replicas deletes nothing and exits 1  <-- pinned defect
+...
+PASS  a plan from the export holds back the replica versions too  <-- pinned defect
+...
+PASS  a prefix of --apply (--ap) is refused, and nothing is read or deleted  <-- pinned defect
+...
+PASS  a prefix of --allow-replica-anchors is refused  <-- pinned defect
 ...
 PASS  the self-test writes no bytecode cache next to the script  <-- pinned defect
 ...
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it
 ------------------------------------------------------------------
-283 assertions, 0 failed
+317 assertions, 0 failed
 ```
 
-The full run prints all 283 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 317 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -143,12 +185,12 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 283 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
+The same 317 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
 Ubuntu the same count also passes under six `TZ` settings, from UTC-11 to UTC+14, because the
 time-zone assertions use an offset that no zone uses. One assertion writes through a dangling
 symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
-it prints a `SKIP` line instead, and the count is 282.
+it prints a `SKIP` line instead, and the count is 316.
 
 ## Usage
 
@@ -182,15 +224,17 @@ Anybody can then plan against that file, with any Python and no arcpy:
 ```
 $ python gdbprune.py --from-versions versions.json
 
-gdbprune 1.1.0  [DRY RUN - nothing is deleted]
+gdbprune 1.3.0  [DRY RUN - nothing is deleted]
   snapshot       : versions.json
-  exported at    : 2026-09-22T06:15:00  (4 day(s) 16 hour(s) before this run)
+  exported at    : 2026-10-07T06:15:00  (1 day(s) 14 hour(s) before this run)
   prune pattern  : %SYNC%
-  older than     : 7 day(s)  (created before 2026-09-19 22:35:11)
+  older than     : 7 day(s)  (created before 2026-10-01 20:48:30)
   scope          : all versions
-  candidate rule : name LIKE '%SYNC%' AND creation_time < DATEADD(day, -7, GETDATE())
-  versions read  : 7
+  candidate rule : name LIKE '%SYNC%' AND name NOT LIKE 'SYNC_SEND%' AND name NOT LIKE 'SYNC_RECEIVE%' AND creation_time < DATEADD(day, -7, GETDATE())
+  versions read  : 9
   undated        : 0 matching version(s) with no readable creation time, never pruned
+  replica anchors: 1 matching SYNC_SEND/SYNC_RECEIVE version(s) held back, never pruned
+  replica in use : 1 matching version(s) that a registered replica uses, never pruned
 
   pass 1  -  2 leaf version(s)
       "DOMAIN\fieldcrew".SYNC_TABLET_07
@@ -198,23 +242,33 @@ gdbprune 1.1.0  [DRY RUN - nothing is deleted]
   pass 2  -  1 leaf version(s)
       gisowner.SYNC_FIELD_0802
 
-  3 version(s) would be deleted across 2 pass(es), per the snapshot exported at 2026-09-22T06:15:00.
+  3 version(s) would be deleted across 2 pass(es), per the snapshot exported at 2026-10-07T06:15:00.
   A snapshot deletes nothing. To act on this plan, run against the live
   workspace, which re-reads the version table first.
 ```
 
-That snapshot holds seven synthetic versions. `SYNC_FIELD_0801` is old and matches, but it
+That snapshot holds nine synthetic versions. `SYNC_FIELD_0801` is old and matches, but it
 stays, because a `QA_REVIEW` version that does not match is still its child. `SYNC_TODAY` is
-too young. The export time is printed in the header and again in the verdict, because a
-snapshot can be stale. `--from-versions` refuses `--apply`: only a live run, which re-reads the
+too young. `SYNC_SEND_41_3` is an old leaf that matches `%SYNC%`, and it stays because it is a
+replica system version. `crew2_FieldSync_1404578882000` is an old leaf that matches too, and it
+stays because the export marked it `"replica": true`: a registered replica uses it. The same
+file planned with `--allow-replica-anchors` lists `sde.SYNC_SEND_41_3` in pass 1, prints
+`4 version(s) would be deleted`, and drops the two `NOT LIKE` clauses from the candidate rule.
+It still holds back `crew2_FieldSync_1404578882000`. The candidate rule does not show that
+check, because it is a list that `ListReplicas` returns, not a column of the version table.
+The export time is printed in the header and again in the verdict, because a snapshot can be
+stale. `--from-versions` refuses `--apply`: only a live run, which re-reads the
 table, may delete.
 
 The `undated` line counts the versions that match the pattern and the scope but have no
-readable creation time. Such a version is never pruned. A live plan prints the same line. A
-table whose creation times cannot be read plans `nothing to prune` exactly like a clean one,
-so this line is the only thing that tells the two apart. The self-test plans a table whose two
-`SYNC` versions carry the times `01/02/2025 10:00:00 AM` and `2025-01-02 03:04:05 -05:00`. It
-asserts `0 version(s) would be deleted` next to `undated        : 2`.
+readable creation time. Such a version is never pruned. A table whose creation times cannot be
+read would otherwise plan `nothing to prune`, exactly like a clean one. So when the count is
+above 0, the plan also prints `UNDATED:` and the run exits `1`. That is true for the live plan,
+for `--apply` and for `--from-versions`. The self-test reads a table whose two `SYNC` versions
+carry the times `01/02/2025 10:00:00 AM` and `2025-01-02 03:04:05 -05:00`. It asserts
+`0 version(s) would be deleted`, `undated        : 2` and exit `1`, for the plan and for
+`--apply`. gdbprune does not guess at a text date such as `01/02/2025`. In one locale it is
+2 January, in another 1 February, and the wrong guess makes a version look older than it is.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -225,14 +279,19 @@ asserts `0 version(s) would be deleted` next to `undated        : 2`.
 | `--from-versions FILE` | none | Plan from a snapshot file instead of a live workspace. Read-only, no arcpy. |
 | `--export-versions FILE` | none | Write the live version table to `FILE` as a snapshot. Needs arcpy and a workspace. Cannot be combined with `--from-versions`. |
 | `--apply` | **off** | Actually delete, or with `--export-versions` actually write the file. Without it, nothing is deleted or written. |
+| `--allow-replica-anchors` | **off** | Let `SYNC_SEND...` and `SYNC_RECEIVE...` replica system versions be candidates. Without it they are never pruned, whatever the pattern or `--only-versions` says. It never releases a version that a registered replica uses. Refused with `--export-versions`. |
 | `--self-test` | off | Run the built-in assertions and exit. |
+
+A flag must be typed in full. argparse would otherwise accept a prefix, so `--ap` would mean
+`--apply` and delete. gdbprune refuses `--ap`, `--appl` and `--allow` with a usage error and
+exit `2`, before it reads anything.
 
 Exit codes:
 
 | Code | Live plan and `--apply` | `--from-versions` and `--export-versions` |
 |---|---|---|
 | `0` | The run finished its work. | The plan finished, or the export ran. |
-| `1` | The run left work, or could not run. See below. | The plan stopped at the pass limit. |
+| `1` | The run left work, or could not run. See below. | The plan stopped at the pass limit, or a matching version has no readable creation time. |
 | `2` | A usage error that argparse reports. | The command could not run. See below. |
 
 A live run exits `1` in each of these cases. Every refusal that 1.0.0 had keeps the `1` it had
@@ -240,25 +299,28 @@ there.
 
 - a version refused to delete
 - the run stopped at the pass limit
+- a matching version had no readable creation time, so it was not assessed (`UNDATED`)
 - re-reading the table after an `--apply` pass failed. The run prints `STOPPED`, lists the
   versions it had deleted, and tries nothing more.
 - the report of an `--apply` run could not be written, for example to a full disk or a closed
   pipe. One line on stderr then gives the number of versions deleted.
 - the command could not run: no arcpy, no workspace, a bad `--prune-pattern`, an out-of-range
-  `--prune-days`, a workspace that does not exist, a version table with no `DEFAULT` row, or a
-  database error that arcpy raises
+  `--prune-days`, a workspace that does not exist, a version table with no `DEFAULT` row, a
+  replica list that `arcpy.da.ListReplicas` could not return, or a database error that arcpy
+  raises
 
 A half-finished `--apply` is never reported as success.
 
-The two snapshot modes are new in 1.1.0, and they exit `2` when they cannot run: an invalid
-or unreadable snapshot, no arcpy, no workspace, an out-of-range `--prune-days`, a version table
-with no `DEFAULT` row, an export path that holds something other than a snapshot, or an
-export path that repeats the workspace string.
+The two snapshot modes are new in 1.1.0, and they exit `2` when they cannot run: an invalid or
+unreadable snapshot (a schema 1 file included), no arcpy, no workspace, an out-of-range
+`--prune-days`, a version table with no `DEFAULT` row, an export path that holds something
+other than a snapshot, an export path that repeats the workspace string, or
+`--allow-replica-anchors` given to `--export-versions`.
 
 A plan exits `0` whether or not it lists versions to delete. So a scheduled `--from-versions`
 check cannot read "stale versions found" from the exit code. It reads the verdict line,
-`N version(s) would be deleted`, and the `undated` line, instead. The exit code tells a finished
-plan (`0`) from a plan cut off at the pass limit (`1`) and from a broken input (`2`).
+`N version(s) would be deleted`, instead. The exit code tells a finished plan (`0`) from a plan
+cut off at the pass limit or one with undated versions (`1`), and from a broken input (`2`).
 
 An unexpected error prints `error: <type>: <text>` and exits with the code for "could not run"
 in its mode. Its text is redacted like the workspace. In 1.0.0 an arcpy error printed a
@@ -283,11 +345,13 @@ name that holds `=` is therefore shown masked after the first `=`.
 ```json
 {
   "format": "gdbprune-versions",
-  "schema_version": 1,
+  "schema_version": 2,
   "exported_at": "2026-09-22T06:15:00",
   "versions": [
-    {"name": "DEFAULT", "parent": null, "owner": "sde", "created": "2019-03-01T08:00:00"},
-    {"name": "SYNC_A", "parent": "DEFAULT", "owner": "gisowner", "created": "2026-08-01T02:00:00.250000"}
+    {"name": "DEFAULT", "parent": null, "owner": "sde", "created": "2019-03-01T08:00:00",
+     "replica": false},
+    {"name": "SYNC_A", "parent": "DEFAULT", "owner": "gisowner",
+     "created": "2026-08-01T02:00:00.250000", "replica": false}
   ]
 }
 ```
@@ -295,13 +359,18 @@ name that holds `=` is therefore shown masked after the first `=`.
 | Field | Type | Rule |
 |---|---|---|
 | `format` | text | exactly `gdbprune-versions` |
-| `schema_version` | integer | exactly `1`. `true` is refused, although Python treats it as 1. |
+| `schema_version` | integer | exactly `2`. `true` is refused, although Python treats it as 1. |
 | `exported_at` | timestamp | when the export ran |
 | `versions` | list | one object per row of `sde.SDE_versions`, every row, unfiltered. It must hold `DEFAULT`. |
 | `versions[].name` | text | not empty, no surrounding space, every character printable |
 | `versions[].parent` | text or null | the same rules as `name`; null for a version with no parent |
 | `versions[].owner` | text | no surrounding space, every character printable. Empty text means no owner. |
 | `versions[].created` | timestamp or null | null means unknown, and such a version is never pruned |
+| `versions[].replica` | `true` or `false` | `true` for a version that a registered replica uses. Such a version is never pruned. |
+
+Schema 1, which gdbprune 1.1.0 and 1.2.0 wrote, has no `replica` field. A plan from it could
+select a version that a replica uses, so the reader refuses it with exit `2`. Export the table
+again.
 
 A timestamp is `YYYY-MM-DDTHH:MM:SS`, with an optional six-digit `.ffffff`, and no offset.
 `exported_at` is the local wall clock of the machine that ran the export. A creation time that
@@ -326,12 +395,12 @@ A character new in Unicode 15.1 is printable to Python 3.13 and unassigned to 3.
 a snapshot that 3.13 accepts can be refused, with exit `2`, by an older Python.
 
 The reader is strict. A missing field, an unknown field, a field repeated in one object, a
-wrong type, `NaN`, a date that does not exist, a space in place of the `T`, a trailing newline,
-non-ASCII digits, a creation time of `""`, `false` or `0`, an unprintable character, a version
-listed twice with the same owner and name, a list with no `DEFAULT` version, and a file nested
-thousands of levels deep are all refused. The error names the field, or the offending value where no field applies, and the run
-exits `2`. A UTF-8 byte order mark is accepted. The self-test holds one assertion for each of
-these.
+wrong type, a `replica` flag that is not `true` or `false`, `NaN`, a date that does not exist,
+a space in place of the `T`, a trailing newline, non-ASCII digits, a creation time of `""`,
+`false` or `0`, an unprintable character, a version listed twice with the same owner and name,
+a list with no `DEFAULT` version, and a file nested thousands of levels deep are all refused.
+The error names the field, or the offending value where no field applies, and the run exits
+`2`. A UTF-8 byte order mark is accepted. The self-test holds one assertion for each of these.
 
 Every traditionally-versioned geodatabase has a `DEFAULT` version, so a list without one is not
 a whole version table. `ArcSDESQLExecute` can return `True`, `None` or an empty list for a
@@ -352,7 +421,8 @@ It asserts that the host and password reach neither the file nor stdout. It also
 
 The export reads back its own text before it writes, so it never writes a file that
 `--from-versions` on the same Python version would refuse. It overwrites only an earlier
-snapshot, and it never writes through a symbolic link whose target is missing. If `FILE` is
+snapshot, a schema 1 snapshot from 1.1.0 or 1.2.0 included, and it never writes through a
+symbolic link whose target is missing. If `FILE` is
 the workspace string itself, the export refuses before it reads the table and exits `2`. That
 stops a repeated connection string, which is not a file yet, from becoming a file named after
 the password. If `FILE` exists and is not a snapshot, for example the `.sde` file spelled
@@ -366,11 +436,122 @@ Precedence, highest first:
 2. the environment variable `SDE_MAINTENANCE_WORKSPACE` (only `--workspace` reads one)
 3. the `CONFIGURATION` block near the top of `gdbprune.py`
 
-That block holds the settings that are deliberately not flags: `RESERVED_VERSIONS`
-(names that are never candidates, `DEFAULT` out of the box), `VERSION_TABLE`,
+That block holds the settings that are deliberately not flags: `RESERVED_VERSIONS` (names that
+are never candidates, `DEFAULT` out of the box), `REPLICA_ANCHOR_PATTERNS` (the replica system
+version names held back unless `--allow-replica-anchors` is given), `VERSION_TABLE`,
 `MAX_PASSES` (100), the two flag defaults, and the snapshot schema's field lists. The same
-precedence is stated in the module docstring and enforced in `main()`. The environment
-variable does not block `--from-versions`; only the `--workspace` flag does.
+precedence is stated in the module docstring and enforced in `main()`. The environment variable
+does not block `--from-versions`; only the `--workspace` flag does.
+
+## Versions that replication uses
+
+### Replica versions in use
+
+Esri's
+[Offline maps and versioned data](https://enterprise.arcgis.com/en/server/11.4/publish-services/windows/offline-maps-and-versioned-data.htm)
+page says that "a replica version is generated from the published version each time you take
+offline a map". Its name joins the user name, the feature service name and a unique ID. With one
+version per user it is the user name and the service name. An anonymous user's version is named
+`Esri_Anonymous_<feature service name>_<ID>`. The page says that "A user's replica version
+remains as long as the user has a map downloaded." When the service name holds `Sync`, the
+default `%SYNC%` pattern matches that version. gdbprune 1.2.0 then planned it and, under
+`--apply`, deleted it.
+
+gdbprune 1.3.0 does not guess from the name. Each time it reads the version table, it also
+calls `arcpy.da.ListReplicas(workspace, True)`, before any delete. With `True` the list also
+holds `SyncReplica` objects, which Esri describes as "a replica created through a sync-enabled
+feature service". A replica's `version` property is "The version from which the replica was
+created (replica version)." gdbprune marks every version named there, compared by unqualified
+name in any letter case. A marked version is never a candidate, whatever `--prune-pattern`,
+`--only-versions` or `--allow-replica-anchors` says. It stays in the tree, so it still pins its
+parent. The plan counts the marked versions that match on the `replica in use` line. If
+`ListReplicas` raises an error, the run stops before it deletes anything and exits `1`. The
+export writes the mark as `"replica": true`, so a plan from the snapshot holds back the same
+versions.
+
+To delete such a version, unregister its replica first. The version then drops off the list.
+For distributed collaboration, the same Esri page says that "no replica version is created when
+data is copied during distributed collaboration workflows".
+
+The self-test pins this through the stand-in arcpy. It registers
+`gisowner.crew_FieldSync_1404578882000` and `sde.Esri_Anonymous_WaterSync` as feature service
+replicas, and `SYNC_EDIT_9` as a geodatabase replica. A live `--apply` with
+`--allow-replica-anchors` then deletes only the one ordinary version. The stand-in returns the
+feature service replicas only when it is called with `True`, so a reader that drops the
+argument fails the test. A `ListReplicas` that raises makes the run delete nothing and exit `1`.
+
+### Replica system versions
+
+Geodatabase replication records system versions in the same version table. Esri's knowledge
+base article 000009436,
+["What are the SYNC_SEND and SYNC_RECEIVE versions in the versions table?"](https://support.esri.com/en-us/knowledge-base/what-are-the-sync-send-and-sync-receive-versions-in-the-000009436),
+says: "In geodatabase replication, on a successful synchronization between primary and
+secondary replicas, SYNC_RECEIVE and SYNC_SEND versions are recorded in the sde versions
+table. These temporary versions are managed by ArcSDE and should not be manually deleted from
+the table. They are deleted when the replica is unregistered by way of the Replica Manager
+dialog box in ArcCatalog or ArcMap." The article is marked for ArcGIS 9.x and 10. The current
+ArcGIS Pro page
+[Synchronization and versioning](https://pro.arcgis.com/en/pro-app/3.4/help/data/geodatabases/overview/synchronization-and-versioning.htm)
+still says that when a replica sends changes, "the replica version (defined during replica
+creation) and system versions are analyzed". It does not name the system versions.
+
+Both names match the default `%SYNC%` pattern, so gdbprune 1.1.0 planned and deleted these
+versions like any other. In a chain of them the newest is the leaf, so a leaf-first prune
+deletes the newest first and walks down the chain one pass at a time. Run through the stand-in
+arcpy, 1.1.0's `--apply` deleted all four versions of a synthetic replica: `SYNC_RECEIVE_7_3`
+and `SYNC_SEND_7_2` in pass 1, then `SYNC_SEND_7_1`, then `SYNC_SEND_7_0`. It exited `0`.
+1.1.0 also read `--ap` as `--apply`.
+
+gdbprune 1.2.0 holds them back. A version is a replica anchor when its unqualified name
+matches the SQL `LIKE` pattern `SYNC_SEND%` or `SYNC_RECEIVE%`, in any letter case. Such a
+version is never a candidate unless `--allow-replica-anchors` is given. That is true for every
+`--prune-pattern`, including `%` and `SYNC_SEND%`, and for an anchor named in
+`--only-versions`. A held-back anchor stays in the tree, so it still pins its parent. In `LIKE`,
+`_` matches any one character, so a look-alike such as `SYNCXSEND_1` is held back too. The
+plan prints the count of matching anchors it held back on the `replica anchors` line, and the
+two `NOT LIKE` clauses in the candidate rule.
+
+The self-test pins this on a synthetic chain of three `SYNC_SEND_7_*` versions, a
+`SYNC_RECEIVE_7_3`, an owner-qualified lower-case `gisowner.sync_send_9_1` and one ordinary
+`SYNC_FIELD_01`. The naive selector picks the newest anchor. The default plan picks only
+`SYNC_FIELD_01` and counts 5 anchors held back. A wide-open run (`%`, 0 days) asks the stand-in
+database to delete only `SYNC_FIELD_01`. A live `--apply` through the stand-in arcpy deletes no
+anchor without the flag, and with it deletes them leaf first.
+
+Release an anchor only after its replica is gone. Esri's article says these versions are
+deleted when the replica is unregistered.
+
+## Reconcile order
+
+gdbprune throws edits away. When the edits in some stale versions must survive, reconcile and
+post those versions first, then prune what is left. The settings below come from Esri's
+[Reconcile Versions](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/reconcile-versions.htm)
+tool reference and the
+[RecommendedReconcileOrder](https://desktop.arcgis.com/en/arcobjects/10.7/net/IVersionedWorkspace2_RecommendedReconcileOrder.htm)
+reference. They were not run against a geodatabase for this README.
+
+1. Reconcile every version whose edits must survive. The default
+   `reconcile_mode="ALL_VERSIONS"` reconciles every edit version with the target.
+   `BLOCKING_VERSIONS` reconciles only the "Versions that are blocking the target version from
+   compressing", in the recommended reconcile order. That order sorts versions by their common
+   ancestor state with `DEFAULT`, so each reconcile lets a later compress move more rows
+   (ArcObjects `IVersionedWorkspace2.RecommendedReconcileOrder`). It leaves out a version that
+   does not block a compress, and such a version can still hold unposted edits. Use
+   `BLOCKING_VERSIONS` to free the compress, not to keep edits.
+2. Do not rely on the defaults to keep conflicting edits. For traditional versioning
+   `conflict_resolution` defaults to `FAVOR_TARGET_VERSION` and `abort_if_conflicts` to
+   `NO_ABORT`. With `with_post="POST"` and `with_delete="DELETE_VERSION"`, every conflict is
+   resolved for the target. Esri does not say what the post then does. The likely result is
+   that the target's side is posted and the version that held the other side is deleted.
+   Pass `abort_if_conflicts="ABORT_CONFLICTS"` instead. Esri describes it as "The
+   reconcile will end if conflicts are found." Pass `out_log` too, and read it.
+3. Resolve each version that stopped at a conflict by hand.
+4. Run gdbprune without `--apply`, read the plan, then run it with `--apply` for the versions
+   whose edits you have decided to discard.
+5. Compress. gdbprune does not.
+
+gdbprune's own order is a different thing. It deletes leaf first because the database refuses
+to drop a version that still has a child. It does not look at states.
 
 ## Why the obvious version is wrong
 
@@ -434,8 +615,8 @@ Real refusals, not a wishlist.
    Versions created or deleted since the export are not in the plan. That is why it
    refuses `--apply`.
 9. **Snapshot timestamps carry no time zone.** They are the exporting machine's wall clock.
-   The example file above, read on a Windows host at UTC-4, reported `4 day(s) 16 hour(s)`.
-   Read in the same minute on an Ubuntu host that runs on UTC, it reported `4 day(s) 20 hour(s)`.
+   The example file above, read on a Windows host at UTC-4, reported `1 day(s) 14 hour(s)`.
+   Read in the same minute on an Ubuntu host that runs on UTC, it reported `1 day(s) 18 hour(s)`.
    Read a snapshot in the time zone it was written in, or allow for the difference.
 10. **The export has not been run against a live geodatabase.** No enterprise geodatabase was
     available for this release. With ArcGIS Pro's real arcpy, the export was run as far as
@@ -446,6 +627,48 @@ Real refusals, not a wishlist.
     `--apply` first, and check its version count against ArcGIS Pro.
 11. **The snapshot names version owners.** Treat it as internal. The repository's
     `.gitignore` ignores `*.json` so that a snapshot is not committed by accident.
+12. **Replica system versions are recognised by name only.** A system version renamed away
+    from `SYNC_SEND...` or `SYNC_RECEIVE...`, or one from a future release that Esri names
+    differently, is not held back. Esri's current documentation does not name these versions;
+    the names come from article 000009436, which is marked for ArcGIS 9.x and 10. Replica
+    versions in use are read from `arcpy.da.ListReplicas`. ArcGIS Pro 3.6's arcpy accepts the
+    call with `True` and returned an empty list for a scratch file geodatabase. It was not run
+    against an enterprise geodatabase that holds replicas. If an installed arcpy's
+    `ListReplicas` does not accept the second argument, the call raises an error, and the live
+    run deletes nothing and exits `1`. Before an `--apply`, read the plan for any version that a
+    replica owns.
+13. **Smaller edge cases.** Each of these was reproduced against this release, except the
+    export race, which follows from the code.
+    - `--only-versions` compares names without regard to letter case. On a case-sensitive
+      database, `--only-versions SYNC_A` also scopes in, and can delete, `sync_a`.
+    - `--only-versions` does not report a name that matches no version. A typo plans
+      `nothing to prune` and exits `0`, so check the plan for each name you gave.
+    - Naming a held-back version in `--only-versions` or `--prune-pattern` also plans
+      `nothing to prune` and exits `0`. The `replica anchors` or `replica in use` line is the
+      only sign that it was refused.
+    - The pattern treats `[` and `]` as plain characters, but SQL Server `LIKE` reads them as a
+      character class. The printed candidate rule can then describe a different selection
+      than the one gdbprune makes.
+    - Pattern and anchor matching use Python's Unicode case rules, so a non-ASCII look-alike
+      such as U+017F (long s) matches `S`.
+    - The anchor test uses the upper-cased last dotted part of the name. A look-alike such as
+      `SYNCXSEND_1` is held back, but a bracketed name such as `[SYNC_SEND_1]` is not.
+    - An owner that holds a dot but no backslash, such as `first.last`, is not quoted.
+      `DeleteVersion` then receives `first.last.SYNC_A` and is likely to refuse it.
+    - With `--allow-replica-anchors`, a partial run deletes the newest anchors first and leaves
+      the oldest. That breaks a replica that is still registered, so release anchors only
+      after the replica is gone.
+    - A secret typed into `--prune-pattern`, `--only-versions` or a stray bare argument is
+      printed as typed, in the plan header or in a usage error. Only the `--workspace`,
+      `--from-versions` and `--export-versions` values are masked.
+    - A password with an unquoted semicolon in a connection-string workspace is masked only up
+      to that semicolon. Use an `.sde` file.
+    - Database error text is shown with connection values masked, but it can still name the
+      database account that failed to log in.
+    - In a live run, exit `1` means that the tool could not run or that it left work. Read
+      stderr to tell them apart.
+    - The export checks the target file before it writes, but not atomically. Do not point it
+      at a path that another process is changing.
 
 ## Contributing
 

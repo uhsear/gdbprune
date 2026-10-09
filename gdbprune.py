@@ -29,27 +29,33 @@ MODES
     --from-versions FILE.json     plan from a snapshot. Read-only,
                                   refuses --apply, never imports arcpy
     --self-test                   the assertions below              (none)
+    --allow-replica-anchors       let SYNC_SEND / SYNC_RECEIVE replica
+                                  system versions be candidates. Off by
+                                  default
 
-SNAPSHOT SCHEMA (format "gdbprune-versions", schema_version 1)
-    {"format": "gdbprune-versions", "schema_version": 1,
+SNAPSHOT SCHEMA (format "gdbprune-versions", schema_version 2)
+    {"format": "gdbprune-versions", "schema_version": 2,
      "exported_at": "2026-09-26T09:30:00",
-     "versions": [{"name": "DEFAULT", "parent": null,
-                   "owner": "sde", "created": "2019-03-01T08:00:00"},
-                  {"name": "SYNC_A", "parent": "DEFAULT",
-                   "owner": "gisowner", "created": "2026-09-01T12:00:00"}]}
+     "versions": [{"name": "DEFAULT", "parent": null, "owner": "sde",
+                   "created": "2019-03-01T08:00:00", "replica": false},
+                  {"name": "SYNC_A", "parent": "DEFAULT", "owner": "gisowner",
+                   "created": "2026-09-01T12:00:00", "replica": false}]}
     Exactly these fields, no more and no fewer, at both levels. Timestamps are
     YYYY-MM-DDTHH:MM:SS with an optional .ffffff and no offset. exported_at
     and a creation time arcpy returns as an aware datetime are the exporting
     machine's local wall clock; a naive creation time is written as the
     database returned it. A creation time returned as text with an offset is
     written as null (unknown, never pruned). parent and created may be null.
+    replica is true for a version that a registered replica uses
+    (arcpy.da.ListReplicas). Schema 1 had no replica field and is refused.
     The list must hold DEFAULT. The connection string, host and password are
     never written. owner values are database accounts, and can include the account
     that ran the export.
 
 EXIT CODES
     0 clean. 1 the run left work: a delete refused, the pass limit was hit,
-    or the table could not be re-read after an applied pass. A live run
+    the table could not be re-read after an applied pass, or a matching
+    version had no readable creation time and was not assessed. A live run
     (plan or --apply) that cannot run exits 1 too, as in 1.0.0. The two
     snapshot modes exit 2 when they cannot run: an invalid snapshot, no
     arcpy, no workspace, an export path that holds something other than a
@@ -61,7 +67,10 @@ CONFIG PRECEDENCE (same order is stated in the README)
 
 SAFETY
     Without --apply the tool prints the plan, deleting nothing and
-    writing nothing.
+    writing nothing. A version that a registered replica uses is never a
+    candidate. Replica system versions (SYNC_SEND..., SYNC_RECEIVE...) are
+    never candidates, whatever the pattern, unless --allow-replica-anchors
+    is given. Flags cannot be abbreviated.
 
     python gdbprune.py --self-test     # no arcpy, no network, no credentials
 """
@@ -81,7 +90,7 @@ import types
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 
 # --------------------------------------------------------------------------
 # CONFIGURATION - tunables that are deliberately not command-line flags.
@@ -91,6 +100,14 @@ __version__ = "1.1.0"
 # Version names that are never candidates, no matter what the flags say.
 # Compared case-insensitively against the unqualified version name.
 RESERVED_VERSIONS = ("DEFAULT",)
+
+# Replica system versions, held back unless --allow-replica-anchors is given.
+# Esri: "SYNC_RECEIVE and SYNC_SEND versions are recorded in the sde versions
+# table ... should not be manually deleted" (knowledge base article 000009436).
+# They are SQL LIKE patterns matched against the unqualified name, so the
+# "_" wildcard also holds back a look-alike such as SYNCXSEND_1. The error
+# direction is a version kept, never an anchor deleted.
+REPLICA_ANCHOR_PATTERNS = ("SYNC_SEND%", "SYNC_RECEIVE%")
 
 # Environment variable consulted when --workspace is absent.
 ENV_WORKSPACE = "SDE_MAINTENANCE_WORKSPACE"
@@ -115,9 +132,9 @@ PRO_PYTHON = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.
 # The version snapshot. Bump SNAPSHOT_SCHEMA_VERSION on any change to the
 # field lists: a reader must refuse a file whose shape it does not know.
 SNAPSHOT_FORMAT = "gdbprune-versions"
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 SNAPSHOT_FIELDS = ("format", "schema_version", "exported_at", "versions")
-VERSION_FIELDS = ("name", "parent", "owner", "created")
+VERSION_FIELDS = ("name", "parent", "owner", "created", "replica")
 
 
 # --------------------------------------------------------------------------
@@ -127,9 +144,12 @@ VERSION_FIELDS = ("name", "parent", "owner", "created")
 #   parent  unqualified name of its parent      e.g. "DEFAULT" or None
 #   owner   database or domain user that owns it
 #   created datetime the version was created (None = unknown, never pruned)
+#   replica True when a registered replica uses it (never pruned); a dict
+#           without the key is not one
 # --------------------------------------------------------------------------
 
-PruneResult = namedtuple("PruneResult", "passes failures versions_seen converged undated error")
+PruneResult = namedtuple("PruneResult",
+                         "passes failures versions_seen converged undated error anchors replicas")
 
 
 class ToolError(Exception):
@@ -171,7 +191,10 @@ def compile_like_pattern(pattern):
     return lambda name: bool(rx.match(name or ""))
 
 
-def build_candidate_where(pattern, prune_days):
+_ANCHOR_MATCHERS = [compile_like_pattern(a) for a in REPLICA_ANCHOR_PATTERNS]
+
+
+def build_candidate_where(pattern, prune_days, allow_anchors=False):
     """Return the SQL predicate that defines 'stale and matching'.
 
     This string is validated and printed in the plan so an auditor can read
@@ -184,8 +207,11 @@ def build_candidate_where(pattern, prune_days):
     compile_like_pattern(pattern)  # validates; raises PatternError
     if int(prune_days) < 0:
         raise ValueError("--prune-days must not be negative")
-    return "name LIKE '%s' AND creation_time < DATEADD(day, -%d, GETDATE())" % (
+    held = "" if allow_anchors else "".join(
+        " AND name NOT LIKE '%s'" % a for a in REPLICA_ANCHOR_PATTERNS)
+    return "name LIKE '%s'%s AND creation_time < DATEADD(day, -%d, GETDATE())" % (
         pattern,
+        held,
         int(prune_days),
     )
 
@@ -244,6 +270,13 @@ def is_reserved(version):
     return node_key(version.get("name")) in {r.upper() for r in RESERVED_VERSIONS}
 
 
+def is_replica_anchor(version):
+    """True for a SYNC_SEND / SYNC_RECEIVE replica version. Compared on
+    node_key(), so `gisowner.sync_send_7_1` is one too."""
+    key = node_key(version.get("name"))
+    return any(m(key) for m in _ANCHOR_MATCHERS)
+
+
 def _in_scope(version, only_upper):
     name = (version.get("name") or "").strip().upper()
     return name in only_upper or qualified_name(version).strip().upper() in only_upper
@@ -260,11 +293,20 @@ def _scope(only_versions):
     return {s.strip().upper() for s in only_versions if s and s.strip()}
 
 
-def _eligible(version, matcher, only_upper):
+def _matches(version, matcher, only_upper):
     """Not reserved, inside the scope, and matching the pattern."""
     return (not is_reserved(version)
             and (only_upper is None or _in_scope(version, only_upper))
             and matcher(version.get("name") or ""))
+
+
+def _eligible(version, matcher, only_upper, allow_anchors=False):
+    """_matches(), not a version a registered replica uses, and not a
+    held-back replica anchor. No flag releases a registered replica's
+    version: unregistering the replica is what releases it."""
+    return (_matches(version, matcher, only_upper)
+            and not version.get("replica")
+            and (allow_anchors or not is_replica_anchor(version)))
 
 
 # The instants between which this module asks the OS for the local offset.
@@ -298,11 +340,14 @@ def has_default(versions):
     return any(node_key(v.get("name")) == "DEFAULT" for v in versions)
 
 
-def select_candidates(versions, matcher, cutoff, only_versions=None):
+def select_candidates(versions, matcher, cutoff, only_versions=None, allow_anchors=False):
     """The one function that decides what may be deleted right now.
 
     A version is a candidate when ALL of these hold:
       * it is not a reserved version (sde.DEFAULT)
+      * no registered replica uses it (the "replica" key)
+      * it is not a replica anchor (SYNC_SEND..., SYNC_RECEIVE...), unless
+        allow_anchors is True
       * it is inside --only-versions, when that scoping was supplied
         (an EMPTY only_versions list scopes to nothing, not to everything)
       * its creation date is strictly older than `cutoff`
@@ -319,7 +364,7 @@ def select_candidates(versions, matcher, cutoff, only_versions=None):
 
     out = []
     for v in versions:
-        if not _eligible(v, matcher, only_upper):
+        if not _eligible(v, matcher, only_upper, allow_anchors):
             continue
         # `cutoff` is naive; a backend column such as SQL Server's
         # datetimeoffset can hand back an aware datetime, and comparing the
@@ -334,7 +379,7 @@ def select_candidates(versions, matcher, cutoff, only_versions=None):
     return out
 
 
-def count_undated(versions, matcher, only_versions=None):
+def count_undated(versions, matcher, only_versions=None, allow_anchors=False):
     """How many versions select_candidates() would weigh but cannot date.
 
     Such a version is never pruned. Without this count, a table whose every
@@ -342,7 +387,22 @@ def count_undated(versions, matcher, only_versions=None):
     clean one, although not a single version was assessed."""
     only_upper = _scope(only_versions)
     return sum(1 for v in versions
-               if _eligible(v, matcher, only_upper) and local_naive(v.get("created")) is None)
+               if _eligible(v, matcher, only_upper, allow_anchors)
+               and local_naive(v.get("created")) is None)
+
+
+def count_anchors(versions, matcher, only_versions=None):
+    """How many replica anchors match the pattern and the scope: the
+    versions the anchor guard holds back, or releases under the flag."""
+    only_upper = _scope(only_versions)
+    return sum(1 for v in versions if is_replica_anchor(v) and _matches(v, matcher, only_upper))
+
+
+def count_replicas(versions, matcher, only_versions=None):
+    """How many versions that a registered replica uses match the pattern
+    and the scope: the versions held back whatever the flags say."""
+    only_upper = _scope(only_versions)
+    return sum(1 for v in versions if v.get("replica") and _matches(v, matcher, only_upper))
 
 
 def prune(
@@ -353,6 +413,7 @@ def prune(
     only_versions=None,
     now=None,
     max_passes=MAX_PASSES,
+    allow_anchors=False,
 ):
     """Leaf-first iterative prune.
 
@@ -362,11 +423,15 @@ def prune(
                  called, and the tree is walked down in memory instead.
 
     Returns PruneResult(passes, failures, versions_seen, converged, undated,
-    error) where `passes` is a list of lists of version dicts, one entry per
+    error, anchors, replicas) where `passes` is a list of lists of version dicts, one entry per
     pass that removed anything, `converged` is False when the run stopped
     with work still outstanding, `undated` is count_undated() of the first
-    read, and `error` is the exception that stopped an applied run after it
-    had deleted something (None otherwise).
+    read, `error` is the exception that stopped an applied run after it
+    had deleted something (None otherwise), and `anchors` is count_anchors()
+    of the first read, and `replicas` is count_replicas() of the first read.
+    A replica anchor is a candidate only when allow_anchors is True, and a
+    registered replica's version never is; held back, each still pins its
+    parent.
     """
     # Validated here, not only in the CLI: this function is the
     # destructive-selection entry point, so the guard belongs where every
@@ -376,7 +441,9 @@ def prune(
 
     survivors = list(fetch())
     versions_seen = len(survivors)
-    undated = count_undated(survivors, matcher, only_versions)
+    undated = count_undated(survivors, matcher, only_versions, allow_anchors)
+    anchors = count_anchors(survivors, matcher, only_versions)
+    replicas = count_replicas(survivors, matcher, only_versions)
     passes = []
     failures = []
     # A version that refused to delete once will refuse again on every later
@@ -387,7 +454,8 @@ def prune(
     refused = set()
 
     def pending():
-        return [v for v in select_candidates(survivors, matcher, cutoff, only_versions)
+        return [v for v in select_candidates(survivors, matcher, cutoff, only_versions,
+                                             allow_anchors)
                 if qualified_name(v) not in refused]
 
     for _ in range(int(max_passes)):
@@ -425,7 +493,8 @@ def prune(
                 # The deletes above cannot be undone. Return them, so the
                 # report lists them and the run exits 1 (left work), not 2
                 # (could not run) with nothing named.
-                return PruneResult(passes, failures, versions_seen, False, undated, exc)
+                return PruneResult(passes, failures, versions_seen, False, undated, exc,
+                                   anchors, replicas)
 
     # The one convergence verdict. Work still pending means max_passes cut
     # the loop off, and main() turns that into a non-zero exit so an
@@ -433,7 +502,8 @@ def prune(
     # the loop: the last allowed pass may take the last candidates without
     # ever running the empty pass that proves it.
     converged = not pending()
-    return PruneResult(passes, failures, versions_seen, converged, undated, None)
+    return PruneResult(passes, failures, versions_seen, converged, undated, None, anchors,
+                       replicas)
 
 
 # --------------------------------------------------------------------------
@@ -445,6 +515,11 @@ def prune(
 
 class SnapshotError(ValueError):
     """Raised for a snapshot that does not match the schema exactly."""
+
+
+class OldSchemaError(SnapshotError):
+    """A schema 1 snapshot. It is refused for planning, but an export may
+    replace it, as it replaces any earlier snapshot."""
 
 
 # [0-9], not \d: \d also matches non-ASCII digits, which strptime then
@@ -477,7 +552,7 @@ def parse_stamp(value, where):
 def build_snapshot(versions, exported_at):
     """The snapshot dict for `versions`. The clock is an argument.
 
-    The four version fields are copied by name and nothing else is. No
+    The five version fields are copied by name and nothing else is. No
     connection detail - workspace path, host, password - is an input to this
     function, so none of it can reach the file. An owner is a database
     account, and the connecting account often owns versions too.
@@ -490,6 +565,7 @@ def build_snapshot(versions, exported_at):
             "parent": v.get("parent") or None,
             "owner": v.get("owner") or "",
             "created": None if created is None else format_stamp(created),
+            "replica": bool(v.get("replica")),
         })
     return {
         "format": SNAPSHOT_FORMAT,
@@ -563,9 +639,13 @@ def parse_snapshot(text):
     if doc["format"] != SNAPSHOT_FORMAT:
         raise SnapshotError("format: expected %r, got %r" % (SNAPSHOT_FORMAT, doc["format"]))
     # type() is int, not isinstance(): True is an int and True == 1.
-    if type(doc["schema_version"]) is not int or doc["schema_version"] != SNAPSHOT_SCHEMA_VERSION:
-        raise SnapshotError(
-            "schema_version: expected %d, got %r" % (SNAPSHOT_SCHEMA_VERSION, doc["schema_version"])
+    version = doc["schema_version"]
+    if type(version) is not int or version != SNAPSHOT_SCHEMA_VERSION:
+        # Schema 1 (gdbprune 1.1.0 and 1.2.0) records no replica versions,
+        # so a plan from it could select one. It is refused, not upgraded.
+        raise (OldSchemaError if type(version) is int and version == 1 else SnapshotError)(
+            "schema_version: expected %d, got %r. Export the table again with this release."
+            % (SNAPSHOT_SCHEMA_VERSION, doc["schema_version"])
         )
     exported_at = parse_stamp(doc["exported_at"], "exported_at")
     if not isinstance(doc["versions"], list):
@@ -586,12 +666,17 @@ def parse_snapshot(text):
         if not _clean_text(row["owner"], allow_empty=True):
             raise SnapshotError("%s.owner: expected text with no surrounding space or "
                                 "unprintable character, got %r" % (where, row["owner"]))
+        # type() is bool, not truthiness: "false" and 0 must not read as False.
+        if type(row["replica"]) is not bool:
+            raise SnapshotError("%s.replica: expected true or false, got %r"
+                                % (where, row["replica"]))
         created = row["created"]
         v = {
             "name": row["name"],
             "parent": row["parent"],
             "owner": row["owner"],
             "created": None if created is None else parse_stamp(created, where + ".created"),
+            "replica": row["replica"],
         }
         # The exact owner.name, as prune() keys it: a case-sensitive backend
         # can hold SYNC_A and sync_a, and the live mode plans both.
@@ -682,17 +767,26 @@ def fetch_versions(workspace):
     elif not isinstance(rows[0], (list, tuple)):
         rows = [rows]
 
+    # The version each registered replica uses: geodatabase replicas and,
+    # with all_replicas True, replicas that a sync-enabled feature service
+    # made for an offline map or a collaboration. Read on every re-read,
+    # before any delete. An error here stops the run: a run that cannot tell
+    # which versions replicas use must not delete any.
+    in_use = {node_key(r.version) for r in arcpy.da.ListReplicas(workspace, True)}
+
     versions = []
     for row in rows:
         name, parent, owner, created = (list(row) + [None, None, None, None])[:4]
         if not name:
             continue
+        name = str(name).strip()
         versions.append(
             {
-                "name": str(name).strip(),
+                "name": name,
                 "parent": str(parent).strip() if parent else None,
                 "owner": str(owner).strip().strip('"') if owner else "",
                 "created": _coerce_datetime(created),
+                "replica": node_key(name) in in_use,
             }
         )
     if not has_default(versions):
@@ -793,10 +887,19 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
     else:
         scope = ", ".join(args.only_versions) or "(empty - nothing is eligible)"
     _say("  scope          : %s" % scope)
-    _say("  candidate rule : %s" % build_candidate_where(args.prune_pattern, args.prune_days))
+    _say("  candidate rule : %s" % build_candidate_where(args.prune_pattern, args.prune_days,
+                                                         args.allow_replica_anchors))
     _say("  versions read  : %d" % result.versions_seen)
     _say("  undated        : %d matching version(s) with no readable creation time,"
          " never pruned" % result.undated)
+    if args.allow_replica_anchors:
+        _say("  replica anchors: ALLOWED by --allow-replica-anchors; %d matching"
+             " SYNC_SEND/SYNC_RECEIVE version(s) can be pruned" % result.anchors)
+    else:
+        _say("  replica anchors: %d matching SYNC_SEND/SYNC_RECEIVE version(s) held back,"
+             " never pruned" % result.anchors)
+    _say("  replica in use : %d matching version(s) that a registered replica uses,"
+         " never pruned" % result.replicas)
     _say("")
 
     total = 0
@@ -828,6 +931,13 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
         _say(
             "  INCOMPLETE: stopped at the %d-pass limit with work still\n"
             "  outstanding. Re-run to continue, or raise MAX_PASSES." % MAX_PASSES
+        )
+        _say("")
+
+    if result.undated:
+        _say(
+            "  UNDATED: %d matching version(s) have no readable creation time, so\n"
+            "  they were not assessed. The run exits 1." % result.undated
         )
         _say("")
 
@@ -919,8 +1029,10 @@ class _FakeGdb(object):
     re-read after an applied pass sees the smaller tree, as a database would.
     """
 
-    def __init__(self, rows, exists=True, locked=()):
+    def __init__(self, rows, exists=True, locked=(), replicas=(), sync_replicas=()):
         self.rows = [list(r) for r in rows]
+        self.replicas = replicas
+        self.sync_replicas = list(sync_replicas)
         self.sql = []
         self.deleted = []
         self.answer = lambda: [list(r) for r in self.rows]
@@ -946,6 +1058,17 @@ class _FakeGdb(object):
         self.module.Exists = lambda path: exists
         self.module.ArcSDESQLExecute = _SQL
         self.module.management = types.SimpleNamespace(DeleteVersion=delete_version)
+
+        def list_replicas(workspace, all_replicas=False):
+            # Only the all-replicas call sees feature service replicas, as
+            # Esri documents; a reader that drops the flag misses them.
+            gdb.sql.append(("replicas", all_replicas))
+            if isinstance(gdb.replicas, Exception):
+                raise gdb.replicas
+            names = list(gdb.replicas) + (gdb.sync_replicas if all_replicas else [])
+            return [types.SimpleNamespace(version=v) for v in names]
+
+        self.module.da = types.SimpleNamespace(ListReplicas=list_replicas)
 
 
 def _with_module(name, module, fn):
@@ -1360,6 +1483,89 @@ def self_test():
     check(c6 == [], "a full run never asks the database to delete DEFAULT")
     check(len(live6) == 1, "DEFAULT survives a wide-open prune")
 
+    # ---- replica anchors ---------------------------------------------------
+    # SYNC_SEND / SYNC_RECEIVE versions are replica system versions. The
+    # default %SYNC% pattern matches them, and in a chain of anchors every
+    # NEWER anchor is a leaf, so a leaf-first prune used to delete exactly
+    # those. Replica ids 7 and 9 are synthetic.
+    anchor_tree = [
+        _v("DEFAULT", owner="sde", age_days=900),
+        _v("SYNC_SEND_7_0", parent="DEFAULT", owner="sde"),
+        _v("SYNC_SEND_7_1", parent="SYNC_SEND_7_0", owner="sde"),
+        _v("SYNC_SEND_7_2", parent="SYNC_SEND_7_1", owner="sde"),
+        _v("SYNC_RECEIVE_7_3", parent="DEFAULT", owner="sde"),
+        _v("gisowner.sync_send_9_1", parent="DEFAULT", owner=""),
+        _v("SYNC_FIELD_01", parent="DEFAULT"),
+    ]
+    naive_anchor = [v["name"] for v in _naive_select(anchor_tree, M, CUTOFF)]
+    anchor_plan = prune(lambda: list(anchor_tree), None, "%SYNC%", 7, now=NOW)
+    check("SYNC_SEND_7_2" in naive_anchor
+          and [[v["name"] for v in p] for p in anchor_plan.passes] == [["SYNC_FIELD_01"]],
+          "the default %SYNC% pattern never selects a SYNC_SEND or SYNC_RECEIVE anchor"
+          "  <-- pinned defect")
+    check(anchor_plan.anchors == 5 and anchor_plan.converged is True,
+          "the plan counts the 5 matching anchors it holds back")
+    fa, da, ca, live_a = _world(anchor_tree)
+    prune(fa, da, "%", 0, now=NOW)
+    check(ca == ["gisowner.SYNC_FIELD_01"] and len(live_a) == 6,
+          "a wide-open --apply never asks the database to delete an anchor  <-- pinned defect")
+    allowed = prune(lambda: list(anchor_tree), None, "%SYNC%", 7, now=NOW, allow_anchors=True)
+    check([[v["name"] for v in p] for p in allowed.passes]
+          == [["SYNC_FIELD_01", "gisowner.sync_send_9_1", "SYNC_RECEIVE_7_3", "SYNC_SEND_7_2"],
+              ["SYNC_SEND_7_1"], ["SYNC_SEND_7_0"]] and allowed.anchors == 5,
+          "with allow_anchors the anchors are candidates, still leaf first")
+    check(prune(lambda: list(anchor_tree), None, "SYNC_SEND%", 7, now=NOW).passes == []
+          and select_candidates(anchor_tree, M, CUTOFF, ["SYNC_SEND_7_2"]) == [],
+          "an anchor pattern or an anchor named in --only-versions still selects nothing"
+          "  <-- pinned defect")
+    pinned_by_anchor = [_v("SYNC_P", parent="DEFAULT"),
+                        _v("SYNC_SEND_7_5", parent="SYNC_P", owner="sde")]
+    check(select_candidates(pinned_by_anchor, M, CUTOFF) == [],
+          "a held-back anchor still pins its parent")
+    check(is_replica_anchor({"name": '"sde"."sync_receive_4_2"'})
+          and is_replica_anchor({"name": "SYNCXSEND_1"})
+          and not is_replica_anchor({"name": "SYNC_SENT_1"})
+          and not is_replica_anchor({"name": "MY_SYNC_SEND_1"})
+          and not is_replica_anchor({"name": None}),
+          "the anchor test is by unqualified name, case-insensitive, with LIKE wildcards")
+    # A version a registered replica uses: an offline map's replica version
+    # takes the user and service names, so "%SYNC%" matches FieldSync's.
+    in_use = [_v("DEFAULT", owner="sde", age_days=900),
+              dict(_v("crew_FieldSync_1404578882000", parent="DEFAULT"), replica=True),
+              dict(_v("SYNC_HELD_P", parent="DEFAULT"), replica=True),
+              _v("SYNC_UNDER", parent="SYNC_HELD_P"),
+              _v("SYNC_FREE", parent="DEFAULT")]
+    in_use_plan = prune(lambda: list(in_use), None, "%", 0, now=NOW, allow_anchors=True)
+    check([[v["name"] for v in p] for p in in_use_plan.passes] == [["SYNC_FREE", "SYNC_UNDER"]]
+          and in_use_plan.replicas == 2,
+          "a version a registered replica uses is never selected, even with the anchor flag"
+          "  <-- pinned defect")
+    check(prune(lambda: list(in_use), None, "%SYNC%", 7, ["SYNC_HELD_P", "SYNC_FREE"],
+                now=NOW).replicas == 1
+          and count_replicas(in_use, compile_like_pattern("crew%")) == 1
+          and count_undated([dict(in_use[1], created=None)], M) == 0,
+          "the replica-in-use count follows the pattern and the scope, and is not undated")
+    check(count_anchors(anchor_tree, compile_like_pattern("SYNC_RECEIVE%")) == 1
+          and count_anchors(anchor_tree, M, ["SYNC_SEND_7_1"]) == 1
+          and count_anchors(anchor_tree, M, []) == 0,
+          "the anchor count follows the pattern and the scope")
+    undated_anchor = [{"name": "SYNC_SEND_7_9", "parent": "DEFAULT", "owner": "", "created": None}]
+    check(count_undated(undated_anchor, M) == 0
+          and count_undated(undated_anchor, M, allow_anchors=True) == 1,
+          "an undated anchor counts as undated only when anchors are allowed")
+    undated_tree = [_v("DEFAULT", owner="sde")] + undated_anchor
+    check(prune(lambda: list(undated_tree), None, "%SYNC%", 7, now=NOW).undated == 0
+          and prune(lambda: list(undated_tree), None, "%SYNC%", 7, now=NOW,
+                    allow_anchors=True).undated == 1
+          and prune(lambda: list(anchor_tree), None, "%SYNC%", 7, ["SYNC_SEND_7_1"],
+                    now=NOW).anchors == 1,
+          "prune() passes the anchor flag to undated and the scope to the anchor count"
+          "  <-- pinned defect")
+    check("NOT LIKE 'SYNC_SEND%'" in build_candidate_where("%SYNC%", 7)
+          and "NOT LIKE 'SYNC_RECEIVE%'" in build_candidate_where("%SYNC%", 7)
+          and "NOT LIKE" not in build_candidate_where("%SYNC%", 7, allow_anchors=True),
+          "the printed candidate rule names the held-back anchors")
+
     # ---- cycles / self-parents -------------------------------------------
     self_parent = [_v("SYNC_LOOP", parent="SYNC_LOOP")]
     f7, d7, c7, _l7 = _world(self_parent)
@@ -1503,10 +1709,12 @@ def self_test():
     # Snapshot schema: build, dump, parse
     # ======================================================================
     snap_versions = [
-        {"name": "DEFAULT", "parent": None, "owner": "sde", "created": datetime(2020, 1, 1)},
+        {"name": "DEFAULT", "parent": None, "owner": "sde", "created": datetime(2020, 1, 1),
+         "replica": False},
         {"name": "SYNC_A", "parent": "DEFAULT", "owner": "gisowner",
-         "created": datetime(2025, 6, 1, 8, 30, 0, 250000)},
-        {"name": "SYNC_B", "parent": "SYNC_A", "owner": "DOMAIN\\jsmith", "created": None},
+         "created": datetime(2025, 6, 1, 8, 30, 0, 250000), "replica": False},
+        {"name": "SYNC_B", "parent": "SYNC_A", "owner": "DOMAIN\\jsmith", "created": None,
+         "replica": True},
     ]
     stamp = datetime(2026, 1, 1, 9, 30, 0)
     built = build_snapshot(snap_versions, stamp)
@@ -1528,7 +1736,7 @@ def self_test():
               "password": "hunter2", "server": "db-host-01"}]
     leak_text = dump_snapshot(build_snapshot(leaky, stamp))
     check("hunter2" not in leak_text and "db-host-01" not in leak_text,
-          "a field outside the four version fields is never copied into the file"
+          "a field outside the five version fields is never copied into the file"
           "  <-- pinned defect")
     # +13:47 again: in the author's own zone the old UTC-5 fixture read the
     # same under the right and the wrong conversion, so it could not fail.
@@ -1545,7 +1753,8 @@ def self_test():
           "a naive creation time is written exactly as the database returned it")
     check(build_snapshot([{"name": "SYNC_E", "parent": "", "owner": None, "created": None}],
                          stamp)["versions"][0] == {"name": "SYNC_E", "parent": None,
-                                                   "owner": "", "created": None},
+                                                   "owner": "", "created": None,
+                                                   "replica": False},
           "an empty parent is written as null and a missing owner as empty text")
     check(parse_stamp("2026-01-01T00:00:00.000001", "t") == datetime(2026, 1, 1, 0, 0, 0, 1),
           "a six-digit fraction parses to microseconds")
@@ -1579,7 +1788,18 @@ def self_test():
     refuses(mutated(lambda d: d["versions"][0].pop("owner")),
             "a version with a missing field is refused", "missing field(s): owner")
     refuses(set_top("format", "something-else"), "a file of another format is refused", "format")
-    refuses(set_top("schema_version", 2), "an unknown schema version is refused", "schema_version")
+    refuses(set_top("schema_version", 3), "an unknown schema version is refused", "schema_version")
+    refuses(set_top("schema_version", 1),
+            "a schema 1 snapshot, which records no replica versions, is refused"
+            "  <-- pinned defect", "Export the table again")
+    raises(lambda: parse_snapshot(set_top("schema_version", 1)),
+           "a schema 1 snapshot raises the old-schema error, which an export may replace", OldSchemaError)
+    refuses(set_row(1, "replica", "false"),
+            "a replica flag given as text is refused, not read as true  <-- pinned defect",
+            "versions[1].replica")
+    refuses(set_row(1, "replica", 0), "a replica flag given as 0 is refused", "versions[1].replica")
+    refuses(mutated(lambda d: d["versions"][1].pop("replica")),
+            "a version with no replica flag is refused", "missing field(s): replica")
     refuses(set_top("schema_version", True),
             "schema_version true is refused although True == 1  <-- pinned defect")
     refuses(set_top("schema_version", "1"), "a schema_version given as text is refused")
@@ -1656,7 +1876,7 @@ def self_test():
     refuses(text.replace('"format": "gdbprune-versions",',
                          '"format": "gdbprune-versions", "format": "gdbprune-versions",'),
             "a field repeated inside one object is refused  <-- pinned defect", "twice")
-    refuses(text.replace('"schema_version": 1', '"schema_version": NaN'),
+    refuses(text.replace('"schema_version": 2', '"schema_version": NaN'),
             "a NaN in the file is refused", "NaN")
     refuses("[]", "a top-level list is refused", "expected an object")
     refuses(set_top("versions", None),
@@ -1783,7 +2003,7 @@ def self_test():
             check(code == 2 and "before the year 1" in out and "Traceback" not in out,
                   "--prune-days %s is refused with exit 2, not an overflow traceback"
                   "  <-- pinned defect" % (days[:3] + "..."))
-        nest_path = put("nest.json", '{"format": "gdbprune-versions", "schema_version": 1, '
+        nest_path = put("nest.json", '{"format": "gdbprune-versions", "schema_version": 2, '
                         '"exported_at": "2026-01-01T00:00:00", "versions": '
                         + "[" * 100000 + "]" * 100000 + "}")
         code, out = _run_cli(["--from-versions", nest_path], None)
@@ -2054,7 +2274,7 @@ def self_test():
               "  <-- pinned defect")
         gdb = _FakeGdb([["DEFAULT", None, "sde", "2020-01-01 00:00:00"],
                         ["SYNC_P", "DEFAULT", "gisowner", "2025-01-01 00:00:00"],
-                        ["SYNC_KID", "gisowner.SYNC_P", "gisowner", None]])
+                        ["SYNC_KID", "gisowner.SYNC_P", "gisowner", real_now]])
         code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
         check(code == 0 and gdb.deleted == [],
               "a live parent named owner-qualified by its child is never deleted"
@@ -2125,10 +2345,10 @@ def self_test():
         check(code == 2 and "invalid int value" in out, "an argparse usage error exits 2")
 
         # A URL or an EZConnect string has no KEY=value form to mask.
-        check(redact("gisadmin/hunter2@dbhost:1521/ORCL") == "(connection string hidden)"
+        check(redact("dbuser/hunter2@dbhost:1521/ORCL") == "(connection string hidden)"
               and redact("postgresql://db-host-01:5432/gis") == "(connection string hidden)",
               "an EZConnect or URL workspace is hidden whole  <-- pinned defect")
-        code, out = _run_cli(["--workspace", "gisadmin/hunter2@dbhost:1521/ORCL"],
+        code, out = _run_cli(["--workspace", "dbuser/hunter2@dbhost:1521/ORCL"],
                              _FakeGdb(live_rows, exists=False).module)
         check(code == 1 and "does not exist" in out and "hunter2" not in out
               and "dbhost" not in out,
@@ -2144,10 +2364,14 @@ def self_test():
 
         # undated, end to end: the one line that tells this plan from a clean one
         code, out = _run_cli(["--workspace", "conn"], _FakeGdb(undated_live).module)
-        check(code == 0 and "undated        : 2 matching version(s)" in out
-              and "0 version(s) would be deleted" in out,
-              "a table of unreadable creation times plans nothing and says 2 are undated"
-              "  <-- pinned defect")
+        check(code == 1 and "undated        : 2 matching version(s)" in out
+              and "0 version(s) would be deleted" in out and "UNDATED: 2 matching" in out,
+              "a table of unreadable creation times plans nothing, says 2 are undated and"
+              " exits 1  <-- pinned defect")
+        gdb = _FakeGdb(undated_live)
+        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        check(code == 1 and gdb.deleted == [] and "UNDATED: 2 matching" in out,
+              "an --apply that could date no matching version exits 1, not 0  <-- pinned defect")
 
         # A re-read that fails after an applied pass: exit 1, the deletes named.
         stop_rows = [["DEFAULT", None, "sde", "2020-01-01 00:00:00"],
@@ -2219,7 +2443,8 @@ def self_test():
               == ["DEFAULT"], "a single row returned flat is read as one version")
         odd = fetched([[None, "DEFAULT", "x", None], ["", "DEFAULT", "x", None],
                        ["  SYNC_S  ", "", None, "junk"], ["DEFAULT", None, "sde", None]])
-        check(odd[0] == {"name": "SYNC_S", "parent": None, "owner": "", "created": None}
+        check(odd[0] == {"name": "SYNC_S", "parent": None, "owner": "", "created": None,
+                         "replica": False}
               and len(odd) == 2,
               "a nameless row is skipped and blank fields normalise to none")
         when = datetime(2025, 1, 2, 3, 4, 5)
@@ -2230,6 +2455,112 @@ def self_test():
               and _coerce_datetime(when) is when
               and _coerce_datetime(None) is None and _coerce_datetime("junk") is None,
               "creation times read as datetime, text in four formats, or none")
+
+        # replica anchors, end to end, and the abbreviation guard
+        anchor_rows = [["DEFAULT", None, "sde", "2020-01-01 00:00:00"],
+                       ["SYNC_SEND_7_0", "DEFAULT", "sde", "2025-01-01 00:00:00"],
+                       ["SYNC_SEND_7_1", "SYNC_SEND_7_0", "sde", "2025-01-02 00:00:00"],
+                       ["SYNC_RECEIVE_7_2", "DEFAULT", "sde", "2025-01-03 00:00:00"],
+                       ["SYNC_FIELD_01", "DEFAULT", "gisowner", "2025-01-01 00:00:00"]]
+        anchor_path = put("anchors.json", dump_snapshot(build_snapshot(
+            _versions_from_rows(anchor_rows), real_now)))
+        code, out = _run_cli(["--from-versions", anchor_path], None)
+        check(code == 0 and pass_lines(out) == ["  pass 1  -  1 leaf version(s)",
+                                                "      gisowner.SYNC_FIELD_01"]
+              and "replica anchors: 3 matching SYNC_SEND/SYNC_RECEIVE version(s) held back" in out
+              and "NOT LIKE 'SYNC_SEND%'" in out,
+              "the default plan holds back the anchors and says how many  <-- pinned defect")
+        code, out = _run_cli(["--from-versions", anchor_path, "--allow-replica-anchors"], None)
+        check(code == 0 and "sde.SYNC_SEND_7_0" in out and "4 version(s) would be deleted" in out
+              and "replica anchors: ALLOWED by --allow-replica-anchors; 3 matching" in out
+              and "NOT LIKE" not in out,
+              "--allow-replica-anchors plans the anchors and says it allowed them")
+        gdb = _FakeGdb(anchor_rows)
+        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_01"],
+              "a live --apply deletes no anchor without the flag  <-- pinned defect")
+        gdb = _FakeGdb(anchor_rows)
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--allow-replica-anchors"],
+                             gdb.module)
+        check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_01", "sde.SYNC_RECEIVE_7_2",
+                                            "sde.SYNC_SEND_7_1", "sde.SYNC_SEND_7_0"],
+              "a live --apply with the flag deletes the anchors leaf first")
+        gdb = _FakeGdb(anchor_rows)
+        code, out = _run_cli(["--export-versions", os.path.join(tmp, "a.json"), "--workspace",
+                              "conn", "--allow-replica-anchors"], gdb.module)
+        check(code == 2 and "replica anchors included" in out and gdb.sql == [],
+              "--export-versions refuses --allow-replica-anchors rather than ignoring it")
+        code, out = _run_cli(["--from-versions", anchor_path, "--only-versions",
+                              "SYNC_SEND_7_1,SYNC_FIELD_01"], None)
+        check(code == 0 and "replica anchors: 1 matching" in out,
+              "the plan's anchor count follows --only-versions  <-- pinned defect")
+        undated_anchor_rows = anchor_rows + [["SYNC_SEND_8_0", "DEFAULT", "sde", None]]
+        ua_path = put("undated-anchor.json", dump_snapshot(build_snapshot(
+            _versions_from_rows(undated_anchor_rows), real_now)))
+        code, out = _run_cli(["--from-versions", ua_path], None)
+        code_f, out_f = _run_cli(["--from-versions", ua_path, "--allow-replica-anchors"], None)
+        check(code == 0 and "undated        : 0" in out
+              and code_f == 1 and "undated        : 1" in out_f and "UNDATED: 1" in out_f,
+              "an undated anchor is undated, and exits 1, only under the flag  <-- pinned defect")
+
+        # replica versions in use (arcpy.da.ListReplicas), end to end
+        fs_name = "gisowner.crew_FieldSync_1404578882000"
+        in_use_rows = [["DEFAULT", None, "sde", "2020-01-01 00:00:00"],
+                       ["crew_FieldSync_1404578882000", "DEFAULT", "gisowner",
+                        "2025-01-01 00:00:00"],
+                       ["Esri_Anonymous_WaterSync", "DEFAULT", "sde", None],
+                       ["SYNC_EDIT_9", "DEFAULT", "gisowner", "2025-01-01 00:00:00"],
+                       ["SYNC_FIELD_02", "DEFAULT", "gisowner", "2025-01-01 00:00:00"]]
+
+        def in_use_gdb():
+            return _FakeGdb(in_use_rows, replicas=["GISOWNER.SYNC_EDIT_9"],
+                            sync_replicas=[fs_name, "sde.Esri_Anonymous_WaterSync"])
+
+        gdb = in_use_gdb()
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--allow-replica-anchors"],
+                             gdb.module)
+        check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_02"]
+              and "replica in use : 3 matching" in out and ("replicas", True) in gdb.sql,
+              "a live --apply deletes no version an offline map or a replica uses, even with"
+              " the flag  <-- pinned defect")
+        gdb = in_use_gdb()
+        gdb.replicas = RuntimeError("cannot list replicas on SERVER=db-host-01;PASSWORD=hunter2")
+        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        check(code == 1 and gdb.deleted == [] and "hunter2" not in out
+              and "cannot list replicas" in out,
+              "a run that cannot list the replicas deletes nothing and exits 1  <-- pinned defect")
+        in_use_path = put("in-use.json", set_top("schema_version", 1))
+        gdb = in_use_gdb()
+        code, out = _run_cli(["--export-versions", in_use_path, "--workspace", "conn",
+                              "--apply"], gdb.module)
+        check(code == 0 and [v["name"] for v in read_snapshot(in_use_path)[1] if v["replica"]]
+              == ["crew_FieldSync_1404578882000", "Esri_Anonymous_WaterSync", "SYNC_EDIT_9"]
+              and "undated        : 1 version(s)" in out,
+              "the export marks the replica versions, counts an undated one, and replaces a"
+              " 1.2.0 snapshot  <-- pinned defect")
+        code, out = _run_cli(["--from-versions", in_use_path], None)
+        check(code == 0 and pass_lines(out) == ["  pass 1  -  1 leaf version(s)",
+                                                "      gisowner.SYNC_FIELD_02"]
+              and "replica in use : 3 matching" in out,
+              "a plan from the export holds back the replica versions too  <-- pinned defect")
+        gdb = _FakeGdb(undated_anchor_rows + in_use_rows[2:3],
+                       sync_replicas=["sde.Esri_Anonymous_WaterSync"])
+        code, out = _run_cli(["--export-versions", os.path.join(tmp, "ua.json"), "--workspace",
+                              "conn"], gdb.module)
+        check(code == 0 and "undated        : 2 version(s) matching" in out,
+              "the export counts an undated anchor and an undated replica version"
+              "  <-- pinned defect")
+
+        for prefix in ("--ap", "--appl"):
+            gdb = _FakeGdb(live_rows)
+            code, out = _run_cli(["--workspace", "conn", prefix], gdb.module)
+            check(code == 2 and "unrecognized arguments: %s" % prefix in out
+                  and gdb.deleted == [] and gdb.sql == [],
+                  "a prefix of --apply (%s) is refused, and nothing is read or deleted"
+                  "  <-- pinned defect" % prefix)
+        code, out = _run_cli(["--from-versions", anchor_path, "--allow"], None)
+        check(code == 2 and "unrecognized arguments: --allow" in out,
+              "a prefix of --allow-replica-anchors is refused  <-- pinned defect")
 
         # importing the module runs nothing and never imports arcpy. Bytecode
         # is off for the probe: the loader would otherwise write __pycache__
@@ -2315,8 +2646,11 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_parser():
+    # allow_abbrev=False: argparse would otherwise read --ap as --apply, so a
+    # typed prefix would delete. A prefix is a usage error, exit 2.
     p = _Parser(
         prog="gdbprune",
+        allow_abbrev=False,
         description=(
             "Delete stale leaf versions from a traditionally-versioned Enterprise "
             "geodatabase, printing a plan first. Live modes need ArcGIS Pro's Python, "
@@ -2371,6 +2705,13 @@ def build_parser():
              "(the default) prints the plan and exits.",
     )
     p.add_argument(
+        "--allow-replica-anchors",
+        action="store_true",
+        help="Let SYNC_SEND and SYNC_RECEIVE replica system versions be candidates. Off "
+             "by default, because Esri says they should not be deleted by hand. A version "
+             "that a registered replica uses is never a candidate.",
+    )
+    p.add_argument(
         "--self-test",
         action="store_true",
         help="Run the built-in assertions and exit. No arcpy, no network, no credentials.",
@@ -2404,10 +2745,11 @@ def run_from_versions(args, now, cutoff):
         prune_days=args.prune_days,
         only_versions=args.only_versions,
         now=now,
+        allow_anchors=args.allow_replica_anchors,
     )
     print_plan(result, args, args.from_versions, cutoff, applied=False,
                exported_at=exported_at, now=now)
-    return 0 if result.converged else 1
+    return 1 if (not result.converged or result.undated) else 0
 
 
 def run_export(args, workspace, now):
@@ -2416,6 +2758,11 @@ def run_export(args, workspace, now):
         raise ToolError(
             "--export-versions always holds the whole version table, because "
             "leafness needs every row. Pass --only-versions when you read the snapshot."
+        )
+    if args.allow_replica_anchors:
+        raise ToolError(
+            "--export-versions always writes every version, replica anchors included. "
+            "Pass --allow-replica-anchors when you read the snapshot."
         )
     if args.export_versions == workspace:
         # The typo that repeats the workspace. A connection string is not a
@@ -2436,6 +2783,8 @@ def run_export(args, workspace, now):
         if os.path.lexists(args.export_versions):
             try:
                 read_snapshot(args.export_versions)
+            except OldSchemaError:
+                pass  # a 1.1.0 or 1.2.0 snapshot, replaced like any earlier one
             except (SnapshotError, OSError) as exc:
                 raise ToolError("%s exists and is not a gdbprune snapshot, so it is not "
                                 "overwritten (%s)"
@@ -2445,7 +2794,11 @@ def run_export(args, workspace, now):
         except OSError as exc:
             raise ToolError("cannot write %s: %s"
                             % (redact(args.export_versions), redact(str(exc))))
-    undated = count_undated(versions, compile_like_pattern(args.prune_pattern))
+    # Every matching undated row it writes null, anchors and replica
+    # versions included, whatever a later plan holds back.
+    matcher = compile_like_pattern(args.prune_pattern)
+    undated = sum(1 for v in versions
+                  if _matches(v, matcher, None) and local_naive(v.get("created")) is None)
     print_export(workspace, args.export_versions, snapshot, text, bool(args.apply), undated)
     return 0
 
@@ -2492,7 +2845,7 @@ def _main(args):
     # database or the snapshot.
     now = datetime.now()
     try:
-        build_candidate_where(args.prune_pattern, args.prune_days)
+        build_candidate_where(args.prune_pattern, args.prune_days, args.allow_replica_anchors)
         cutoff = compute_cutoff(now, args.prune_days)
     except ValueError as exc:  # PatternError is a ValueError
         raise ToolError(str(exc))
@@ -2521,6 +2874,7 @@ def _main(args):
         prune_days=args.prune_days,
         only_versions=args.only_versions,
         now=now,
+        allow_anchors=args.allow_replica_anchors,
     )
 
     try:
@@ -2532,7 +2886,9 @@ def _main(args):
         _say("error: the report could not be written; %d version(s) had been deleted"
              % (sum(len(p) for p in result.passes) if args.apply else 0), sys.stderr)
         raise
-    return 1 if (result.failures or not result.converged) else 0
+    # undated: a matching version that could not be dated was not assessed,
+    # so "nothing to prune" would be a guess. Exit 0 means every one was.
+    return 1 if (result.failures or not result.converged or result.undated) else 0
 
 
 if __name__ == "__main__":

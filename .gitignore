@@ -15,3 +15,6 @@ logs/
 *.env
 credentials*
 *token*
+
+# coverage run --branch writes this next to the script.
+.coverage
