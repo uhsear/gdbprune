@@ -30,7 +30,7 @@ through a different API. If your data is branch-versioned, stop here.
 (`arcpy.management.ReconcileVersions`) can post each edit version to its target and then
 delete it, with `with_post="POST"` and `with_delete="DELETE_VERSION"`. It does well what
 gdbprune never does: it moves the edits into the target before the version goes. With its
-default settings it does not keep every edit. For traditional versioning the defaults are
+default conflict settings, a `POST` and `DELETE_VERSION` run does not keep every edit. For traditional versioning the defaults are
 `conflict_resolution="FAVOR_TARGET_VERSION"` and `abort_if_conflicts="NO_ABORT"`. Esri's tool
 page says "All conflicts will be resolved in favor of the target version", and that with
 `NO_ABORT` "The reconcile will not end if conflicts are found." Esri's ArcMap page
@@ -202,7 +202,8 @@ time-zone assertions use an offset that no zone uses. One assertion writes throu
 symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
 it prints a `SKIP` line instead, and the count is 326. Branch coverage excludes that `SKIP`
 branch with a `pragma: no cover` comment, because a host that can create the link never runs it.
-Branch coverage was measured on Windows only, because the Linux host has no `coverage` package.
+Branch coverage was measured at 100% on Windows. On Ubuntu, a virtual environment that holds
+`coverage` also measured 100% branch coverage with 327 assertions.
 
 The harness checks itself. A probe feeds six known failures through `check()`, `raises()` and
 `refuses()`. If fewer than six are recorded, the run fails even when `check()` itself is broken,
@@ -849,6 +850,28 @@ Real refusals, not a wishlist.
     - The export opens `FILE` for writing before it writes. A write that fails part way, for
       example on a full disk, destroys the earlier snapshot and leaves a truncated file. The
       next export refuses to overwrite that file, so delete it by hand.
+    - For a domain owner, write the owner-qualified name with the owner in double quotes, as
+      the plan prints it. With `--only-versions`, the unquoted form `DOMAIN\crew.SYNC_T` matches
+      nothing, plans `nothing to prune` and exits `0`.
+    - An owner column returned with padding is trimmed before the export. No assertion covers
+      that trim.
+    - A snapshot re-saved as UTF-16, as Windows PowerShell 5.1 `Out-File` does by default, is
+      refused with exit `2`. Save it as UTF-8.
+    - The pattern treats a backslash as a plain character, but PostgreSQL `LIKE` reads it as an
+      escape, so the printed rule can differ there.
+    - A `FILE` that differs from the workspace string by even one character, such as a trailing
+      space, is not refused.
+    - A SQL Server database with a case-sensitive collation can hold `SYNC_SEND_1` and
+      `Sync_Send_1` as two versions. gdbprune holds back both, because the anchor match ignores
+      letter case.
+    - Esri does not say that the Pro tool's recommended reconcile order is the ArcObjects
+      `RecommendedReconcileOrder` method. The Reconcile order section assumes it.
+    - Esri article 000009436 returned HTTP 403 to automated fetches, and the archived copy of
+      article 000011719 could not be fetched in the last audit. The `SYNC_RECEIVE_REC` name form
+      is therefore unconfirmed. Check both links before you rely on them.
+    - The self-test label `the written file holds no connection string, host, connecting user or
+      password` is narrower than it reads. The file can name the connecting account when that
+      account owns a version, and the assertion uses an account that owns none.
 
 ## Contributing
 
