@@ -1130,6 +1130,9 @@ def _footer(total, failed):
 def self_test():
     passed = [0]
     failed = []
+    # The arcpy entry as the caller left it: absent, or the real one in the
+    # ArcGIS Pro Python window. Every stand-in must leave it so.
+    arcpy_at_start = sys.modules.get("arcpy")
 
     def check(cond, label):
         if cond:
@@ -2654,8 +2657,9 @@ def self_test():
         outer, inner = _FakeGdb([]).module, _FakeGdb([]).module
         seen = _with_module("arcpy", outer, lambda: (
             _with_module("arcpy", inner, lambda: sys.modules["arcpy"]), sys.modules["arcpy"]))
-        check(seen == (inner, outer) and "arcpy" not in sys.modules,
-              "a stand-in arcpy is removed afterwards, and a nested one restores the outer")
+        check(seen == (inner, outer) and sys.modules.get("arcpy") is arcpy_at_start,
+              "a stand-in arcpy is removed afterwards, and a nested one restores the outer"
+              "  <-- pinned defect")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         os.environ.pop(ENV_WORKSPACE, None)

@@ -157,7 +157,7 @@ PASS  a prefix of --apply (--ap) is refused, and nothing is read or deleted  <--
 PASS  a prefix of --allow-replica-anchors is refused  <-- pinned defect
 ...
 PASS  the self-test writes no bytecode cache next to the script  <-- pinned defect
-...
+PASS  a stand-in arcpy is removed afterwards, and a nested one restores the outer  <-- pinned defect
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
@@ -464,10 +464,12 @@ Esri's
 [Offline maps and versioned data](https://enterprise.arcgis.com/en/server/11.4/publish-services/windows/offline-maps-and-versioned-data.htm)
 page says that "a replica version is generated from the published version each time you take
 offline a map". Its name joins the user name, the feature service name and a unique ID. With one
-version per user it is the user name and the service name. An anonymous user's version is named
-`Esri_Anonymous_<feature service name>_<ID>`. The page says that "A user's replica version
-remains as long as the user has a map downloaded." When the service name holds `Sync`, the
-default `%SYNC%` pattern matches that version, and gdbprune 1.1.0 selects it like any other.
+version per user it is the user name and the service name. On a server with no user accounts,
+the version per map is named `Esri_Anonymous_<feature service name>_<ID>`, and the version per
+user is `Esri_Anonymous_<feature service name>`, shared by every user. The page says that "A
+user's replica version remains as long as the user has a map downloaded." When the service name
+holds `Sync`, the default `%SYNC%` pattern matches that version, and gdbprune 1.1.0 selects it
+like any other.
 Given a synthetic snapshot that holds `gisowner.crew_FieldSync_1404578882000`, 1.1.0 planned it
 for deletion.
 
@@ -477,11 +479,12 @@ calls `arcpy.da.ListReplicas(workspace, True)`, before any delete. Esri's
 page says that the default call returns "Only Replica objects", and that these "include
 replicas created from geodatabase replication workflows as well as replicas created from
 feature services running on traditional versioned data". So an offline map on the data that
-gdbprune serves comes back as a `Replica`. Its `version` property is "The version from which the
-replica was created (replica version)." With `True` the list can also hold `SyncReplica`
-objects. Esri's `SyncReplica` page says that those include replicas "created from nonversioned
-data with archiving or from branch versioned data", so they are not expected to name a
-traditional version. gdbprune passes `True` only so that the guard reads the widest list.
+gdbprune serves comes back as a `Replica`. Esri's
+[Replica](https://pro.arcgis.com/en/pro-app/latest/arcpy/data-access/replica.htm) class page
+gives its `version` property as "The version from which the replica was created (replica
+version)." With `True` the list can also hold `SyncReplica` objects. Esri's `SyncReplica`
+page says that those include replicas "created from nonversioned data with archiving or from
+branch versioned data", so they are not expected to name a traditional version. gdbprune passes `True` only so that the guard reads the widest list.
 gdbprune marks every version named there, compared by unqualified
 name in any letter case. A marked version is never a candidate, whatever `--prune-pattern`,
 `--only-versions` or `--allow-replica-anchors` says. It stays in the tree, so it still pins its
@@ -572,10 +575,12 @@ reference. They were not run against a geodatabase for this README.
    target version from compressing", and the tool page says "This option uses the recommended
    reconcile order." That page does not describe the order. The ArcObjects reference
    `IVersionedWorkspace2.RecommendedReconcileOrder` sorts versions by their common ancestor
-   state with `DEFAULT`. It does not say why. That the order lets a later compress move more
-   rows is inferred, not stated by Esri. It leaves out a version that
-   does not block a compress, and such a version can still hold unposted edits. Use
-   `BLOCKING_VERSIONS` to free the compress, not to keep edits.
+   state with `DEFAULT`. Its Remarks give the reason: "The method is intended to be used
+   prior to running a compress. If all or some of the versions returned by the
+   RecommendedReconcileOrder are reconciled based upon the enumeration's order, the compress
+   operation will be able to move more rows from a table's versioned delta tables to the base
+   tables." It leaves out a version that does not block a compress, and such a version can
+   still hold unposted edits. Use `BLOCKING_VERSIONS` to free the compress, not to keep edits.
 2. Do not rely on the defaults to keep conflicting edits. For traditional versioning
    `conflict_resolution` defaults to `FAVOR_TARGET_VERSION` and `abort_if_conflicts` to
    `NO_ABORT`. With `with_post="POST"` and `with_delete="DELETE_VERSION"`, every conflict is
@@ -668,7 +673,11 @@ Real refusals, not a wishlist.
 12. **Replica system versions are recognised by name only.** A system version renamed away
     from `SYNC_SEND...` or `SYNC_RECEIVE...`, or one from a future release that Esri names
     differently, is not held back. Esri's current documentation does not name these versions;
-    the names come from article 000009436, which is marked for ArcGIS 9.x and 10. Replica
+    the names come from article 000009436, which is marked for ArcGIS 9.x and 10, and from the
+    archived article 000011719, which is marked for ArcSDE 10 and 10.2. That second article
+    also says that "These versions are hidden by design, which means they are not displayed in
+    ArcGIS and not returned by ArcObjects." So the ArcGIS Pro version list may not show an
+    anchor that the plan counts. Replica
     versions in use are read from `arcpy.da.ListReplicas`. ArcGIS Pro 3.6's arcpy accepts the
     call with `True` and returned an empty list for a scratch file geodatabase. It was not run
     against an enterprise geodatabase that holds replicas. If an installed arcpy's
@@ -759,7 +768,11 @@ Real refusals, not a wishlist.
     - An anchor name with a prefix, such as `REP_SYNC_SEND_1`, is not held back, because the
       anchor patterns match from the start of the name.
     - `--allow-replica-anchors` does not check whether an anchor's replica is still
-      registered. It releases every matching anchor.
+      registered. It releases every matching anchor, and it does not require
+      `--only-versions`, so with the default `%SYNC%` pattern it releases the anchors of every
+      replica. Esri article 000011719 finds an orphan by comparing the replica id in its
+      `SYNC_SEND_<replica id>_<generation number>` name with the registered replica ids. Make
+      that comparison yourself, then name only the orphans in `--only-versions`.
     - `ListReplicas` runs on every read of the version table, so a slow call is paid once per
       pass.
     - A version name from a live database is printed as it is, control characters included.
@@ -795,13 +808,25 @@ Real refusals, not a wishlist.
       young or still pinned by a child. It can be larger than the number the plan deletes.
     - On a stand-in table of 100,000 versions with chains 50 deep, a dry run took about 12
       seconds of CPU. A live run adds one table read and one `ListReplicas` call per pass.
-    - Only CPython 3.9, 3.12 and 3.13 were run. Python 3.10 and 3.11 are untested.
+    - The self-test was run on CPython 3.9, 3.11, 3.12 and 3.13 on Windows, and on CPython
+      3.12 on Linux. No other release was run.
     - Other local users can see a connection-string `--workspace` in the process list while
       the run lasts. Use an `.sde` file or `SDE_MAINTENANCE_WORKSPACE` instead.
     - If `--export-versions` names a symbolic link to an existing snapshot, the export
       overwrites the snapshot that the link points to.
     - If `--from-versions` names a FIFO or a device, the read can block. The reader loads the
       whole file into memory, however large it is.
+    - A live version name made only of spaces is read as an empty name. A live plan never
+      prunes it, and `--export-versions` refuses the whole table with exit `2`, because the
+      snapshot would not read back.
+    - A version that another owner names `DEFAULT`, such as `gisowner.DEFAULT`, is treated as
+      the reserved `DEFAULT`. It is never pruned, and it alone satisfies the check that the
+      table holds `DEFAULT`.
+    - The live read `SELECT name, parent_name, owner, creation_time FROM sde.SDE_versions` was
+      run only against the stand-in arcpy, not a real geodatabase. If a column or table name
+      differs, every live run exits `1`.
+    - The export refusal `export refused, the snapshot would not read back` prints the
+      offending name or owner without masking, even when it holds `KEY=value` text.
 
 ## Contributing
 
