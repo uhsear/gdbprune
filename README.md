@@ -158,12 +158,12 @@ PASS  a prefix of --allow-replica-anchors is refused  <-- pinned defect
 PASS  the self-test writes no bytecode cache next to the script  <-- pinned defect
 ...
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
-PASS  a failed assertion makes the self-test exit 1 and names it
+PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-321 assertions, 0 failed
+324 assertions, 0 failed
 ```
 
-The full run prints all 321 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 324 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -190,12 +190,19 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 321 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
+The same 324 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
 Ubuntu the same count also passes under six `TZ` settings, from UTC-11 to UTC+14, because the
 time-zone assertions use an offset that no zone uses. One assertion writes through a dangling
 symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
-it prints a `SKIP` line instead, and the count is 320.
+it prints a `SKIP` line instead, and the count is 323. Branch coverage excludes that `SKIP`
+branch with a `pragma: no cover` comment, because a host that can create the link never runs it.
+
+The harness checks itself. A probe feeds six known failures through `check()`, `raises()` and
+`refuses()`. If fewer than six are recorded, the run fails even when `check()` itself is broken,
+because that verdict is added to the failure list directly. The exit code is taken from the
+failure list as well as from the footer, so a footer that always reports success cannot make a
+red run exit `0`. Each of the two one-line breaks was run against this release, and each exits `1`.
 
 ## Usage
 
@@ -512,14 +519,20 @@ still says that when a replica sends changes, "the replica version (defined duri
 creation) and system versions are analyzed". It does not name the system versions.
 
 Both names match the default `%SYNC%` pattern, so gdbprune 1.1.0 planned and deleted these
-versions like any other. In a chain of them the newest is the leaf, so a leaf-first prune
-deletes the newest first and walks down the chain one pass at a time. Run through the stand-in
-arcpy, 1.1.0's `--apply` deleted all four versions of a synthetic replica: `SYNC_RECEIVE_7_3`
+versions like any other. Esri does not say how these versions are parented. The self-test
+fixture chains them, newest as the leaf, and a leaf-first prune then deletes the newest first
+and walks down the chain one pass at a time. Run on that fixture through the stand-in arcpy, 1.1.0's `--apply` deleted all four versions of a synthetic replica: `SYNC_RECEIVE_7_3`
 and `SYNC_SEND_7_2` in pass 1, then `SYNC_SEND_7_1`, then `SYNC_SEND_7_0`. It exited `0`.
 1.1.0 also read `--ap` as `--apply`.
 
 gdbprune 1.3.0 holds them back. A version is a replica anchor when its unqualified name
-matches the SQL `LIKE` pattern `SYNC_SEND%` or `SYNC_RECEIVE%`, in any letter case. Such a
+matches the SQL `LIKE` pattern `SYNC_SEND%` or `SYNC_RECEIVE%`, in any letter case. Esri's
+archived technical article 000011719,
+["How To: Determine if there are detached replica system versions in the geodatabase"](https://web.archive.org/web/20210805015432/https://support.esri.com/en/technical-article/000011719),
+names three forms: `SYNC_RECEIVE_<replica id>_<generation number>`,
+`SYNC_RECEIVE_REC_<replica id>_<generation number>` and
+`SYNC_SEND_<replica id>_<generation number>`. The `SYNC_RECEIVE%` pattern covers the second
+form too, and the self-test pins `SYNC_RECEIVE_REC_12_3` as an anchor. Such a
 version is never a candidate unless `--allow-replica-anchors` is given. That is true for every
 `--prune-pattern`, including `%` and `SYNC_SEND%`, and for an anchor named in
 `--only-versions`. A held-back anchor stays in the tree, so it still pins its parent. In `LIKE`,
@@ -669,6 +682,9 @@ Real refusals, not a wishlist.
     - Naming a held-back version in `--only-versions` or `--prune-pattern` also plans
       `nothing to prune` and exits `0`. The `replica anchors` or `replica in use` line is the
       only sign that it was refused.
+    - The same is true of a default plan whose only matches are held-back anchors or replica
+      versions in use: it prints `0 version(s)` to delete and exits `0`. A scheduler must read
+      the `replica anchors` and `replica in use` lines to see that anything was held.
     - The pattern treats `[` and `]` as plain characters, but SQL Server `LIKE` reads them as a
       character class. The printed candidate rule can then describe a different selection
       than the one gdbprune makes.
@@ -688,12 +704,20 @@ Real refusals, not a wishlist.
       `--from-versions` and `--export-versions` values are masked.
     - A password with an unquoted semicolon in a connection-string workspace is masked only up
       to that semicolon. Use an `.sde` file.
-    - Database error text is shown with connection values masked, but it can still name the
-      database account that failed to log in.
+    - Database error text is masked only where it has the `KEY=value` form. It can still name
+      the database account that failed to log in, or a host or instance name in a connection
+      string such as `sde:sqlserver:HOST`.
     - In a live run, exit `1` means that the tool could not run or that it left work. Read
       stderr to tell them apart.
     - The export checks the target file before it writes, but not atomically. Do not point it
       at a path that another process is changing.
+    - `--prune-days` is read by Python's `int()`, so it accepts any Unicode decimal digits. An
+      Arabic-Indic three (U+0663) reads as `3`.
+    - A hand-edited snapshot can list one version twice, with owners that differ only in letter
+      case, such as `Crew.SYNC_A` and `crew.SYNC_A`. The reader accepts both and the plan counts
+      both. On a case-insensitive database that is one version.
+    - `--self-test` ignores every other flag. `gdbprune --self-test --apply` runs only the
+      self-test, deletes nothing, and exits `0`.
 14. **Found in review.** The stand-in arcpy reproduced each item that names a behaviour. The
     items about Esri or Oracle say what was not checked.
     - If `DeleteVersion` returns without an error but leaves the version in place, gdbprune
@@ -718,7 +742,10 @@ Real refusals, not a wishlist.
       matches it like any other version, for example in a service named `FieldSync`.
     - Esri describes a synchronization version, a child of the replica version that holds
       received changes until they are reconciled and posted, but does not give its name. It
-      is held back only if its name starts with `SYNC_SEND` or `SYNC_RECEIVE`.
+      is held back only if its name starts with `SYNC_SEND` or `SYNC_RECEIVE`. For a
+      checkout/check-in replica, Esri says this version "is created at the time of replica
+      creation", so it exists from replica creation until changes are posted, and can be old
+      enough to match `--prune-days`. `ListReplicas` reports the replica version, not this child.
     - If a distributed collaboration replica on traditionally versioned data records
       `SYNC_SEND...` or `SYNC_RECEIVE...` versions, the same name rule holds them back. No
       collaboration was run for this release.
@@ -737,10 +764,14 @@ Real refusals, not a wishlist.
       reader refuses such a name.
     - On Oracle the version table is `SDE.VERSIONS`, not `sde.SDE_versions`, so the default
       `VERSION_TABLE` query is expected to fail there with exit `1`. No Oracle geodatabase was
-      tested.
+      tested. A SQL Server geodatabase in the `dbo` schema keeps the table as
+      `dbo.SDE_versions`, so the default query fails there too, and the run exits `1` without
+      planning anything. Edit `VERSION_TABLE` for such a geodatabase.
     - If `ArcSDESQLExecute` returns `creation_time` as locale-formatted text, such as
       `1/1/2025 12:00:00 AM`, every matching version is undated and never pruned. The run
       prints `UNDATED` and exits `1`. No live database was checked for this format.
+    - A creation time returned as text with more than seven fraction digits, as an Oracle
+      `TIMESTAMP(9)` column can give, is also read as undated, so the run exits `1`.
     - An `.sde` path that holds `@`, as in `sde@gisdb.sde`, prints as
       `(connection string hidden)`, so the plan header does not show which workspace was read.
     - `--workspace ""` falls back to `SDE_MAINTENANCE_WORKSPACE`, because an empty flag counts
