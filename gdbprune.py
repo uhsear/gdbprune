@@ -2236,8 +2236,9 @@ def self_test():
         gdb = _FakeGdb(live_rows)
         code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_C", "gisowner.SYNC_B",
-                                            "gisowner.SYNC_A"],
-              "--apply deletes through DeleteVersion strictly leaf to root")
+                                            "gisowner.SYNC_A"]
+              and "APPLY - versions are being deleted" in out and "DRY RUN" not in out,
+              "--apply deletes through DeleteVersion strictly leaf to root, under an APPLY header")
         check(len([s for s in gdb.sql if s[0] == "execute"]) == 4,
               "--apply re-reads the version table after every pass")
         gdb = _FakeGdb(live_rows, locked=("gisowner.SYNC_C",))
@@ -2630,6 +2631,21 @@ def self_test():
         code, out = _run_cli(["--from-versions", anchor_path, "--allow"], None)
         check(code == 2 and "unrecognized arguments: --allow" in out,
               "a prefix of --allow-replica-anchors is refused  <-- pinned defect")
+        # An unset shell variable gives an empty FILE. The mode is chosen by
+        # "is not None", so "" still picks the snapshot mode, never the delete.
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--export-versions", "", "--apply", "--workspace", "conn"],
+                             gdb.module)
+        check(code == 2 and gdb.deleted == [],
+              "--export-versions \"\" --apply is an export that fails, not a delete"
+              "  <-- pinned defect")
+        gdb = _FakeGdb(live_rows)
+        os.environ[ENV_WORKSPACE] = "env-conn"
+        code, out = _run_cli(["--from-versions", "", "--apply"], gdb.module)
+        os.environ.pop(ENV_WORKSPACE, None)
+        check(code == 2 and "refuses --apply" in out and gdb.deleted == [] and gdb.sql == [],
+              "--from-versions \"\" --apply with the workspace variable set is refused,"
+              " not a delete  <-- pinned defect")
 
         # importing the module runs nothing and never imports arcpy. Bytecode
         # is off for the probe: the loader would otherwise write __pycache__

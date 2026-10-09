@@ -33,10 +33,12 @@ gdbprune never does: it moves the edits into the target before the version goes.
 default settings it does not keep every edit. For traditional versioning the defaults are
 `conflict_resolution="FAVOR_TARGET_VERSION"` and `abort_if_conflicts="NO_ABORT"`. Esri's tool
 page says "All conflicts will be resolved in favor of the target version", and that with
-`NO_ABORT` "The reconcile will not end if conflicts are found." The page does not say what the
-post then does. The likely result is that the target's side of each conflict is posted, and the
-delete removes the version that held the other side. That result is inferred from Esri's
-documentation. It was not run against a geodatabase. If your stale versions might hold edits
+`NO_ABORT` "The reconcile will not end if conflicts are found." Esri's ArcMap page
+[Reconciling a version](https://desktop.arcgis.com/en/arcmap/latest/manage-data/geodatabases/reconciling-a-version.htm)
+says what that resolution does: "If you resolve in favor of the target version, all conflicting
+features in the current edit session are replaced by their representations in the target
+version." So the post sends the target's side of each conflict, and the delete then removes the
+version that held the other side. That sequence was not run against a geodatabase. If your stale versions might hold edits
 somebody wants, use that tool with the settings in [Reconcile order](#reconcile-order).
 gdbprune is for versions whose edits you have already decided to throw away.
 
@@ -155,16 +157,18 @@ PASS  a plan from the export holds back the replica versions too  <-- pinned def
 PASS  a prefix of --apply (--ap) is refused, and nothing is read or deleted  <-- pinned defect
 ...
 PASS  a prefix of --allow-replica-anchors is refused  <-- pinned defect
+PASS  --export-versions "" --apply is an export that fails, not a delete  <-- pinned defect
+PASS  --from-versions "" --apply with the workspace variable set is refused, not a delete  <-- pinned defect
 ...
 PASS  the self-test writes no bytecode cache next to the script  <-- pinned defect
 PASS  a stand-in arcpy is removed afterwards, and a nested one restores the outer  <-- pinned defect
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-325 assertions, 0 failed
+327 assertions, 0 failed
 ```
 
-The full run prints all 325 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 327 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -191,13 +195,14 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 325 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10
-and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
+The same 327 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10,
+3.11.15 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
 Ubuntu the same count also passes under six `TZ` settings, from UTC-11 to UTC+14, because the
 time-zone assertions use an offset that no zone uses. One assertion writes through a dangling
 symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
-it prints a `SKIP` line instead, and the count is 324. Branch coverage excludes that `SKIP`
+it prints a `SKIP` line instead, and the count is 326. Branch coverage excludes that `SKIP`
 branch with a `pragma: no cover` comment, because a host that can create the link never runs it.
+Branch coverage was measured on Windows only, because the Linux host has no `coverage` package.
 
 The harness checks itself. A probe feeds six known failures through `check()`, `raises()` and
 `refuses()`. If fewer than six are recorded, the run fails even when `check()` itself is broken,
@@ -388,8 +393,7 @@ again.
 A timestamp is `YYYY-MM-DDTHH:MM:SS`, with an optional six-digit `.ffffff`, and no offset.
 `exported_at` is the local wall clock of the machine that ran the export. A creation time that
 arcpy returns as an aware `datetime` object is converted to that clock first. A creation time
-without an offset, which is what `ArcSDESQLExecute` usually returns, is written exactly as the
-database returned it. Its clock is the database's, often the database server's local time or
+without an offset is written exactly as the database returned it. Its clock is the database's, often the database server's local time or
 UTC. A seventh fraction digit, as SQL Server's `datetime2` gives, rounds up to the microsecond,
 so a version never reads older than it is.
 
@@ -579,13 +583,16 @@ reference. They were not run against a geodatabase for this README.
    prior to running a compress. If all or some of the versions returned by the
    RecommendedReconcileOrder are reconciled based upon the enumeration's order, the compress
    operation will be able to move more rows from a table's versioned delta tables to the base
-   tables." It leaves out a version that does not block a compress, and such a version can
-   still hold unposted edits. Use `BLOCKING_VERSIONS` to free the compress, not to keep edits.
+   tables." The same Remarks give the filter: "If a version's common ancestor state is equal
+   to or greater than the state the DEFAULT version references, it will not be included in the
+   enumeration." Such a version can still hold unposted edits. Use `BLOCKING_VERSIONS` to free the compress, not to keep edits.
 2. Do not rely on the defaults to keep conflicting edits. For traditional versioning
    `conflict_resolution` defaults to `FAVOR_TARGET_VERSION` and `abort_if_conflicts` to
    `NO_ABORT`. With `with_post="POST"` and `with_delete="DELETE_VERSION"`, every conflict is
-   resolved for the target. Esri does not say what the post then does. The likely result is
-   that the target's side is posted and the version that held the other side is deleted.
+   resolved for the target. Esri's ArcMap page on reconciling says that then "all conflicting
+   features in the current edit session are replaced by their representations in the target
+   version." The post sends the target's side, and the delete removes the version that held
+   the other side.
    Pass `abort_if_conflicts="ABORT_CONFLICTS"` instead. Esri describes it as "The
    reconcile will end if conflicts are found." Pass `out_log` too, and read it.
 3. Resolve each version that stopped at a conflict by hand.
@@ -808,8 +815,8 @@ Real refusals, not a wishlist.
       young or still pinned by a child. It can be larger than the number the plan deletes.
     - On a stand-in table of 100,000 versions with chains 50 deep, a dry run took about 12
       seconds of CPU. A live run adds one table read and one `ListReplicas` call per pass.
-    - The self-test was run on CPython 3.9, 3.11, 3.12 and 3.13 on Windows, and on CPython
-      3.12 on Linux. No other release was run.
+    - The self-test was run on CPython 3.9.25, 3.11.15, 3.12.10 and 3.13.2 and on ArcGIS Pro's
+      Python 3.13.7 on Windows, and on CPython 3.12.3 on Linux. No other release was run.
     - Other local users can see a connection-string `--workspace` in the process list while
       the run lasts. Use an `.sde` file or `SDE_MAINTENANCE_WORKSPACE` instead.
     - If `--export-versions` names a symbolic link to an existing snapshot, the export
@@ -827,6 +834,21 @@ Real refusals, not a wishlist.
       differs, every live run exits `1`.
     - The export refusal `export refused, the snapshot would not read back` prints the
       offending name or owner without masking, even when it holds `KEY=value` text.
+    - An error that gdbprune raises itself reaches stderr without a second masking pass, so it
+      is only as safe as the message that raised it. The pattern text and the export read-back
+      names above are the values that reach stderr unmasked.
+    - A version name that ends in a dot, such as `SYNC_SEND_5.`, gets an empty leafness key.
+      That key matches the empty parent of `DEFAULT`, so the version counts as pinned. It is
+      never pruned and never counted as an anchor, and the plan says `nothing to prune` with
+      exit `0`.
+    - Old matching versions that form a parent cycle, or a version that is its own parent, plan
+      `nothing to prune` and exit `0`. They appear on no count line.
+    - A table read that returns fewer than four columns pads each row with nulls. Every
+      matching version is then reported `UNDATED`, and the run exits `1`. The message points at
+      the dates, not at the query.
+    - The export opens `FILE` for writing before it writes. A write that fails part way, for
+      example on a full disk, destroys the earlier snapshot and leaves a truncated file. The
+      next export refuses to overwrite that file, so delete it by hand.
 
 ## Contributing
 
