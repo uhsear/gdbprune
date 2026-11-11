@@ -123,7 +123,8 @@ RESERVED_VERSIONS = ("DEFAULT",)
 
 # Replica system versions, held back unless --allow-replica-anchors is given.
 # Esri: "SYNC_RECEIVE and SYNC_SEND versions are recorded in the sde versions
-# table ... should not be manually deleted" (knowledge base article 000009436).
+# table ... should not be manually deleted" (knowledge base article 000009436,
+# quoted from a search excerpt: the page itself returned HTTP 403 when fetched).
 # They are SQL LIKE patterns matched against the unqualified name, so the
 # "_" wildcard also holds back a look-alike such as SYNCXSEND_1. The error
 # direction is a version kept, never an anchor deleted.
@@ -995,7 +996,7 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
         _say("  snapshot       : %s" % redact(workspace))
         _say("  exported at    : %s  (%s)"
               % (format_stamp(exported_at), describe_age(exported_at, now)))
-    _say("  prune pattern  : %s" % args.prune_pattern)
+    _say("  prune pattern  : %s" % redact(args.prune_pattern))
     _say(
         "  older than     : %d day(s)  (created before %s)"
         % (args.prune_days, cutoff.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1003,10 +1004,10 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
     if args.only_versions is None:
         scope = "all versions"
     else:
-        scope = ", ".join(args.only_versions) or "(empty - nothing is eligible)"
+        scope = redact(", ".join(args.only_versions)) or "(empty - nothing is eligible)"
     _say("  scope          : %s" % scope)
-    _say("  candidate rule : %s" % build_candidate_where(args.prune_pattern, args.prune_days,
-                                                         args.allow_replica_anchors))
+    _say("  candidate rule : %s" % redact(build_candidate_where(
+        args.prune_pattern, args.prune_days, args.allow_replica_anchors)))
     _say("  versions read  : %d" % result.versions_seen)
     _say("  undated        : %d matching version(s) with no readable creation time,"
          " never pruned" % result.undated)
@@ -2080,6 +2081,7 @@ def self_test():
         check(code == 0 and "pass 3  -  1 leaf version(s)" in out and "gisowner.SYNC_A" in out,
               "--from-versions plans the full leaf-first chain from a file")
         check(code == 0, "--from-versions runs with arcpy unimportable  <-- pinned defect")
+
         check(out.count(stamp_text) == 2 and "exported at    : %s" % stamp_text in out
               and "per the snapshot exported at %s." % stamp_text in out,
               "the export time is printed in the header and in the verdict")
@@ -2093,6 +2095,15 @@ def self_test():
         check(shown is not None and abs((datetime.strptime(shown.group(1), "%Y-%m-%d %H:%M:%S")
                                          - (datetime.now() - timedelta(days=7))).total_seconds())
               < 120, "the snapshot plan prints the cutoff it used, --prune-days before now")
+
+        # A connection string typed into the wrong flag must not reach the log.
+        for flag, value in (("--only-versions", "PWD=hunter2;SERVER=sql01"),
+                            ("--prune-pattern", "%PWD=hunter2%"),
+                            ("--prune-pattern", "x'PWD=hunter2;SERVER=sql01")):
+            code, out = _run_cli(["--from-versions", snap_path, flag, value], None)
+            check("hunter2" not in out and "sql01" not in out,
+                  "a secret typed into %s is masked in the plan and the error"
+                  "  <-- pinned defect" % flag)
 
         code, out = _run_cli(["--from-versions", snap_path, "--apply"], None)
         check(code == 2 and "refuses --apply" in out,
@@ -3301,7 +3312,7 @@ def _main(args):
         build_candidate_where(args.prune_pattern, args.prune_days, args.allow_replica_anchors)
         cutoff = compute_cutoff(now, args.prune_days)
     except ValueError as exc:  # PatternError is a ValueError
-        raise ToolError(str(exc))
+        raise ToolError(redact(str(exc)))
 
     if args.from_versions is not None:
         return run_from_versions(args, now, cutoff)

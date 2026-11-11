@@ -109,6 +109,8 @@ PASS  a file nested 100000 levels deep is refused, not a traceback  <-- pinned d
 PASS  --from-versions runs with arcpy unimportable  <-- pinned defect
 PASS  the export time is printed in the header and in the verdict
 ...
+PASS  a secret typed into --only-versions is masked in the plan and the error  <-- pinned defect
+PASS  a secret typed into --prune-pattern is masked in the plan and the error  <-- pinned defect
 PASS  --from-versions refuses --apply: a snapshot cannot delete  <-- pinned defect
 ...
 PASS  a non-cp1252 name prints escaped to a cp1252 stdout, not a crash  <-- pinned defect
@@ -180,10 +182,10 @@ PASS  a stand-in arcpy is removed afterwards, and a nested one restores the oute
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-371 assertions, 0 failed
+374 assertions, 0 failed
 ```
 
-The full run prints all 371 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 374 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -211,7 +213,7 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 371 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
+The same 374 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
 3.12.10, 3.10.20 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3
 on Ubuntu. 3.9 and 3.12 ran with `-W error`. On Ubuntu the same count also passes under three
 `TZ` settings: UTC, UTC-11 and UTC+14. The time-zone assertions use an offset that no zone
@@ -219,9 +221,10 @@ uses. One assertion writes through a dangling symbolic link. On a Windows host t
 create one (no Developer Mode, no admin rights), it prints a `SKIP` line instead, and the count
 is 370. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
 a host that can create the link never runs it. Branch coverage was measured at 100% on Windows
-(1502 statements, 226 branches). On Ubuntu, a virtual environment that holds `coverage` also
-measured 100% branch coverage with 371 assertions. `pyflakes` reports nothing on both hosts, and
-`python -W error` compiles the file without a warning.
+(1505 statements, 228 branches). On Ubuntu, a virtual environment that holds `coverage` also
+measured 100% branch coverage with 374 assertions. `pyflakes` reports nothing on both hosts, in
+that same virtual environment, because system `python3` on Ubuntu has no `pyflakes` or `coverage`
+module. `python -W error` compiles the file without a warning.
 
 The harness checks itself. A probe feeds six known failures through `check()`, `raises()` and
 `refuses()`. If fewer than six are recorded, the run fails even when `check()` itself is broken,
@@ -426,8 +429,8 @@ one-row table. It refuses every other result as "no database name": `False`, `Tr
 an empty list, two columns, two rows, a number, and text with a leading or trailing space or
 an unprintable character.
 
-What the refusals look like. These are real runs against the self-test's stand-in arcpy
-(see Limitation 14). In the second run the stand-in server reports the database `GIS_TEST`.
+What the refusals look like. These are runs of the real code against the self-test's stand-in
+arcpy (see Limitation 14). In the second run the stand-in server reports the database `GIS_TEST`.
 In the third it reports `GIS_PROD`.
 
 ```
@@ -844,11 +847,14 @@ Real refusals, not a wishlist.
       the oldest. That breaks a replica that is still registered, so release anchors only
       after the replica is gone.
     - A secret typed into `--prune-pattern`, `--only-versions` or a stray bare argument is
-      printed as typed, in the plan header or in a usage error. Only the `--workspace`,
-      `--from-versions` and `--export-versions` values are masked.
+      masked in the plan header, the candidate rule and the refusal only where it has the
+      `KEY=value` form, a quote or brace next to `=`, `@`, or `://`. A pattern with such text is
+      shown masked, so the line can differ from what was typed. A bare word with no such form
+      is printed as typed.
     - A password with an unquoted semicolon in a connection-string workspace is masked only up
       to that semicolon. Use an `.sde` file.
-    - Database error text is masked only where it has the `KEY=value` form. It can still name
+    - Database error text is masked only where it has the `KEY=value` form. A bare password
+      word, such as `password: X` inside an arcpy error, is printed as is. It can still name
       the database account that failed to log in, or a host or instance name in a connection
       string such as `sde:sqlserver:HOST`.
     - In a live run, exit `1` means that the tool could not run or that it left work. Read
@@ -961,8 +967,8 @@ Real refusals, not a wishlist.
     - The export refusal `export refused, the snapshot would not read back` prints the
       offending name or owner without masking, even when it holds `KEY=value` text.
     - An error that gdbprune raises itself reaches stderr without a second masking pass, so it
-      is only as safe as the message that raised it. The pattern text and the export read-back
-      names above are the values that reach stderr unmasked.
+      is only as safe as the message that raised it. The export read-back names above are the
+      values that reach stderr unmasked.
     - A version name that ends in a dot, such as `SYNC_SEND_5.`, gets an empty leafness key.
       That key matches the empty parent of `DEFAULT`, so the version counts as pinned. It is
       never pruned and never counted as an anchor, and the plan says `nothing to prune` with
@@ -1013,6 +1019,17 @@ Real refusals, not a wishlist.
       during the run is not caught.
     - Only `sqlserver` and `postgresql` have a query. An Oracle or Db2 geodatabase is refused
       with exit `1`, so its `--apply` cannot run with this release.
+    - The expected-database check is required only for a live `--apply`. A plan and an
+      `--apply --export-versions` run may omit it, and a plan without the flag prints
+      `database : not checked`. That is honest, but a looser reading of "required".
+    - Every Esri, SQL Server and PostgreSQL behaviour of the guard (the `dbClient` spelling, the
+      return shape of `ArcSDESQLExecute`, `DB_NAME()` and `current_database()`) was checked only
+      against Esri and Microsoft pages and the stand-in arcpy.
+    - A database name with surrounding space or an unprintable character cannot be matched, so
+      `--apply` always refuses it and deletes nothing.
+    - The code comment that quotes Esri knowledge base article 000009436 is unverified, because
+      that page returned HTTP 403 when fetched. The `ListReplicas` quote on the replica pages is
+      cut off in the fetched excerpt, so its full wording is unverified too.
     - The comparison is exact, whatever the server's collation. If a server accepts two
       spellings of one database name, the guard accepts only the spelling the server returns.
       Retype the flag with the case the refusal prints.
