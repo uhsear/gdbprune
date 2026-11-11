@@ -8,11 +8,16 @@ Two years later the version table holds hundreds of them, and each one still ref
 database states that a compress cannot remove.
 
 So somebody writes the obvious cleanup: select every `SYNC` version older than a week, then
-delete each one. The first parent in that list fails, because the database refuses to drop a
-version that still has a child. The script either stops halfway or swallows the error and moves
-on. Either way the parents stay, and the next night adds another layer on top of them. The same
-pattern also matches versions that replication still uses. Esri says not to delete the
-`SYNC_SEND` and `SYNC_RECEIVE` versions by hand. An offline map's replica version is named
+delete each one. The first parent in that list is the trap. Connected as the geodatabase
+administrator, deleting a parent also deletes every descendant version, whether or not the
+descendant matches the pattern or has been posted. Esri's page
+[Delete a traditional version](https://pro.arcgis.com/en/pro-app/latest/help/data/geodatabases/overview/delete-a-traditional-version.htm)
+says: "If you delete a version that has child versions that you own, or if you are connected to
+the geodatabase as the geodatabase administrator, the version and all its descendent versions
+will be deleted." A child that a crew still edits goes with its parent, and the list never
+named it. The same pattern also matches versions that replication still uses. Esri says not to
+delete the `SYNC_SEND` and `SYNC_RECEIVE` versions by hand
+([see below](#replica-system-versions)). An offline map's replica version is named
 after the user and the feature service, so a service named `FieldSync` can give one that
 matches. That version stays in use while the map is downloaded.
 
@@ -184,10 +189,10 @@ PASS  a stand-in arcpy is removed afterwards, and a nested one restores the oute
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-374 assertions, 0 failed
+376 assertions, 0 failed
 ```
 
-The full run prints all 374 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 376 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -215,16 +220,16 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 374 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
+The same 376 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
 3.12.10, 3.10.20 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3
 on Ubuntu. 3.9 and 3.12 ran with `-W error`. On Ubuntu the same count also passes under three
 `TZ` settings: UTC, UTC-11 and UTC+14. The time-zone assertions use an offset that no zone
 uses. One assertion writes through a dangling symbolic link. On a Windows host that cannot
 create one (no Developer Mode, no admin rights), it prints a `SKIP` line instead, and the count
-is 370. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
+is 372. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
 a host that can create the link never runs it. Branch coverage was measured at 100% on Windows
-(1505 statements, 228 branches). On Ubuntu, a virtual environment that holds `coverage` also
-measured 100% branch coverage with 374 assertions. `pyflakes` reports nothing on both hosts, in
+(1516 statements, 230 branches). On Ubuntu, a virtual environment that holds `coverage` also
+measured 100% branch coverage with 376 assertions. `pyflakes` reports nothing on both hosts, in
 that same virtual environment, because system `python3` on Ubuntu has no `pyflakes` or `coverage`
 module. `python -W error` compiles the file without a warning.
 
@@ -733,16 +738,17 @@ reference. They were not run against a geodatabase for this README.
    whose edits you have decided to discard.
 5. Compress. gdbprune does not.
 
-gdbprune's own order is a different thing. It deletes leaf first because the database refuses
-to drop a version that still has a child. It does not look at states.
+gdbprune's own order is a different thing. It deletes leaf first because a leaf has no
+descendants for the delete to take with it. It does not look at states.
 
 ## Why the obvious version is wrong
 
 The naive tool is one query and one loop: select every version matching the pattern and
 older than N days, then delete them. On any version tree deeper than one level that
-selection contains parents whose children are still alive, and the database rejects
-every one of them. Sorting the list does not save it either, because a child that does
-*not* match the pattern still pins a parent that does.
+selection contains parents whose children are still alive. Run as the administrator,
+deleting such a parent also deletes its descendants, so the run removes versions that the plan
+never listed. Sorting the list does not save it either, because a child that does *not* match
+the pattern still hangs under a parent that does.
 
 gdbprune reads the **entire** version table unfiltered, so leafness is computed over
 every row, then selects only versions that nothing else names as a parent. After each
@@ -857,10 +863,10 @@ Real refusals, not a wishlist.
       is printed as typed.
     - A password with an unquoted semicolon in a connection-string workspace is masked only up
       to that semicolon. Use an `.sde` file.
-    - Database error text is masked only where it has the `KEY=value` form. A bare password
-      word, such as `password: X` inside an arcpy error, is printed as is. It can still name
-      the database account that failed to log in, or a host or instance name in a connection
-      string such as `sde:sqlserver:HOST`.
+    - Database error text is masked where it has the `KEY=value` form, and hidden whole when it
+      names a credential word such as `password: X`. It can still name the database account
+      that failed to log in, or a host or instance name in a connection string such as
+      `sde:sqlserver:HOST`.
     - In a live run, exit `1` means that the tool could not run or that it left work. Read
       stderr to tell them apart.
     - The export checks the target file before it writes, but not atomically. Do not point it
@@ -872,7 +878,7 @@ Real refusals, not a wishlist.
       both. On a case-insensitive database that is one version.
     - `--self-test` ignores every other flag. `gdbprune --self-test --apply` runs only the
       self-test, deletes nothing, and exits `0`.
-14. **Found in review.** The stand-in arcpy reproduced each item that names a behaviour. The
+14. **Edge cases found by testing.** The stand-in arcpy reproduced each item that names a behaviour. The
     items about Esri or Oracle say what was not checked.
     - If `DeleteVersion` returns without an error but leaves the version in place, gdbprune
       tries it again on every pass, and reports `100 version(s) deleted across 100 pass(es)`
@@ -1001,14 +1007,14 @@ Real refusals, not a wishlist.
       letter case.
     - Esri does not say that the Pro tool's recommended reconcile order is the ArcObjects
       `RecommendedReconcileOrder` method. The Reconcile order section assumes it.
-    - Esri article 000009436 returned HTTP 403 to automated fetches, and the archived copy of
-      article 000011719 could not be fetched in the last audit. The `SYNC_RECEIVE_REC` name form
-      is therefore unconfirmed. Check both links before you rely on them.
+    - Both Esri articles, 000009436 and 000011719 (the archived copy), were fetched. The quoted
+      sentences and the `SYNC_RECEIVE_REC` name form matched. Both articles are old, so check the
+      links before you rely on them.
     - The self-test label `the written file holds no connection string, host, connecting user or
       password` is narrower than it reads. The file can name the connecting account when that
       account owns a version, and the assertion uses an account that owns none.
 
-14. **The database guard compares one name, once, and has only run against a stand-in.**
+15. **The database guard compares one name, once, and has only run against a stand-in.**
     - No geodatabase was available for this release. The guard was exercised through the
       self-test's stand-in `arcpy` module, which returns what Esri's pages say the real calls
       return. It was not run against a SQL Server or PostgreSQL geodatabase. If `dbClient`
@@ -1020,8 +1026,7 @@ Real refusals, not a wishlist.
       server or instance. Esri's `connectionProperties` also has an `instance` property, and
       gdbprune does not read it. Give the two databases different names, or check the host in
       the connection file.
-    - The repository already had this guard when this round started (version 1.4.0). A live
-      `--apply` without `--expect-database` is refused before anything is read.
+    - A live `--apply` without `--expect-database` is refused before anything is read.
     - Oracle and Db2 geodatabases cannot run `--apply` with this release, because only
       `sqlserver` and `postgresql` have a name query. Esri lists the `dbClient` values as
       examples, not a complete list, so a platform with another spelling is refused.
@@ -1042,9 +1047,23 @@ Real refusals, not a wishlist.
       against Esri and Microsoft pages and the stand-in arcpy.
     - A database name with surrounding space or an unprintable character cannot be matched, so
       `--apply` always refuses it and deletes nothing.
-    - The code comment that quotes Esri knowledge base article 000009436 is unverified, because
-      that page returned HTTP 403 when fetched. The `ListReplicas` quote on the replica pages is
-      cut off in the fetched excerpt, so its full wording is unverified too.
+    - The `ListReplicas` quote on the replica pages is cut off in the fetched excerpt, so its
+      full wording is unverified. Esri's pages for the `Replica` and `SyncReplica` classes
+      returned 404, so gdbprune reads `.version` on each item without a documented guarantee.
+      A replica object without that attribute makes a live run exit `1` before it deletes
+      anything.
+    - The example snapshot behind the `--from-versions` plan above is described, not shipped, and
+      the self-test uses different fixtures. A reader cannot rebuild its numbers from the four
+      files alone.
+    - The export writes the snapshot with the process's default file permissions. On a shared
+      folder, other users can read the version owner names it holds.
+    - A database name that holds `=`, `@` or `://` prints masked, or as `(connection string
+      hidden)`, in the `--expect-database` refusal. The comparison is exact and is not affected.
+    - The 100% branch figure excludes one `except` branch, on the symlink fallback
+      marked `# pragma: no cover`. It cannot be reached on a host that allows symlinks.
+    - Error text that names a credential word (`password`, `pwd`, `passwd`, `secret`, `token`)
+      is hidden whole, so a message can lose the detail that explains the failure. A workspace
+      path with such a word as a whole path segment is hidden too.
     - The comparison is exact, whatever the server's collation. If a server accepts two
       spellings of one database name, the guard accepts only the spelling the server returns.
       Retype the flag with the case the refusal prints.

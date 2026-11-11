@@ -10,9 +10,11 @@ WHO THIS IS FOR
     live in a different system table and are removed through a different API.
 
 WHY LEAF-FIRST
-    The relational database refuses to drop a version that is still the parent
-    of another version. A single "delete everything old that matches" pass
-    therefore selects parents whose children are still alive and fails on them.
+    Esri's page "Delete a traditional version" says that connected as the
+    geodatabase administrator, deleting a version also deletes all its
+    descendent versions. A single "delete everything old that matches" pass
+    therefore selects parents whose children are still alive, and deleting a
+    parent destroys the children too, including ones that match nothing.
     gdbprune runs iterative passes: each pass deletes only versions that are
     currently leaves, then re-reads the version table and repeats. A parent
     becomes eligible only once its children are actually gone. The loop stops
@@ -123,8 +125,7 @@ RESERVED_VERSIONS = ("DEFAULT",)
 
 # Replica system versions, held back unless --allow-replica-anchors is given.
 # Esri: "SYNC_RECEIVE and SYNC_SEND versions are recorded in the sde versions
-# table ... should not be manually deleted" (knowledge base article 000009436,
-# quoted from a search excerpt: the page itself returned HTTP 403 when fetched).
+# table ... should not be manually deleted" (knowledge base article 000009436).
 # They are SQL LIKE patterns matched against the unqualified name, so the
 # "_" wildcard also holds back a look-alike such as SYNCXSEND_1. The error
 # direction is a version kept, never an anchor deleted.
@@ -957,6 +958,9 @@ def _mute_stdout():
     os.close(null)
 
 
+_CREDENTIAL_WORD = re.compile(r"\b(?:pwd|passwd|password|secret|token)\b(?!=\*\*\*)", re.IGNORECASE)
+
+
 def redact(text):
     """A workspace, or an error that may quote one, for display. The values
     of a connection string (KEY=value;...) are hidden, so a password, user
@@ -966,10 +970,18 @@ def redact(text):
     Hidden whole instead: a string with a brace or a quote next to an '='
     (PWD={a;b} holds a ';'), and any string with '@' or '://'. A URL
     (scheme://user:password@host) or an EZConnect string (user/password@host)
-    has no KEY=value form, and a password may itself hold ':', '/' or '@'."""
+    has no KEY=value form, and a password may itself hold ':', '/' or '@'.
+
+    Also hidden whole: text that still names a credential word (password,
+    pwd, passwd, secret, token) after the KEY=value masking, such as an
+    arcpy message "Login failed: password: ...". The value cannot be told
+    from the prose around it, so nothing is kept."""
     if ("=" in text and re.search(r"[{}'\"]", text)) or "@" in text or "://" in text:
         return "(connection string hidden)"
-    return re.sub(r"=[^;]*", "=***", text)
+    masked = re.sub(r"=[^;]*", "=***", text)
+    if _CREDENTIAL_WORD.search(masked):
+        return "(message hidden: it names a credential)"
+    return masked
 
 
 def _database_line(database):
@@ -1630,7 +1642,7 @@ def self_test():
     f6, d6, c6, live6 = _world(default_only)
     prune(f6, d6, "%", 7, now=NOW)
     check(c6 == [], "a full run never asks the database to delete DEFAULT")
-    check(len(live6) == 1, "DEFAULT survives a wide-open prune")
+    check(len(live6) == 1, "the DEFAULT version survives a wide-open prune")
 
     # ---- replica anchors ---------------------------------------------------
     # SYNC_SEND / SYNC_RECEIVE versions are replica system versions. The
@@ -2705,6 +2717,24 @@ def self_test():
               and "hunter2" not in out and "Traceback" not in out,
               "an arcpy error exits 1 with its text redacted, not a traceback"
               "  <-- pinned defect")
+
+        # A bare password word in an arcpy message has no KEY=value form.
+        gdb = _FakeGdb(live_rows)
+
+        def leaks():
+            raise RuntimeError("Login failed for sde: password: Zq9-probe-secret")
+
+        gdb.answer = leaks
+        code, out = _run_cli(["--workspace", "prod.sde", "--apply", *GUARD], gdb.module)
+        check(code == 1 and "error: RuntimeError" in out and "Zq9-probe-secret" not in out
+              and "Traceback" not in out,
+              "an arcpy error that names a bare password never reaches the output"
+              "  <-- pinned defect")
+        check(redact("token abc123") == redact("Secret: x") == redact("PWD =x")
+              == "(message hidden: it names a credential)"
+              and redact("PWD=x;SERVER=y") == "PWD=***;SERVER=***"
+              and redact("bypass passes") == "bypass passes",
+              "a credential word is hidden whole, a masked key is not, a look-alike is kept")
 
         # A value in braces or quotes can hold ';'.
         check(redact("SERVER=db-host-01;UID=sde;PWD={hunter2;tail-of-secret}")
