@@ -21,6 +21,11 @@ repeats until a pass finds nothing. It never deletes a version that `arcpy.da.Li
 names as a registered replica's version. It never deletes a `SYNC_SEND` or `SYNC_RECEIVE`
 version unless you name a flag. Without `--apply` it prints the plan and deletes nothing.
 
+**It refuses to delete from the wrong database.** A live `--apply` needs
+`--expect-database NAME`. Before gdbprune reads the version table or deletes anything, it asks
+the server for the name of the database it is connected to. It refuses, with exit `1`, unless
+that name equals `NAME`. See [The wrong-database guard](#the-wrong-database-guard).
+
 **Who this is for.** A paid ArcGIS Enterprise install, a **traditionally-versioned**
 geodatabase, and an admin `.sde` connection file. Branch-versioned shops get nothing
 from this tool: branch versions live in a different system table and are removed
@@ -52,7 +57,7 @@ replica system versions. gdbprune never makes one of those a candidate unless yo
 
 ```
 $ python gdbprune.py --self-test
-gdbprune 1.3.0 self-test (no arcpy, no network, no credentials)
+gdbprune 1.4.0 self-test (no arcpy, no network, no credentials)
 ------------------------------------------------------------------
 PASS  chain pass 1 selects exactly the leaf SYNC_C
 PASS  chain pass 1 does NOT select SYNC_B (has live child)
@@ -128,6 +133,16 @@ PASS  a table holding SYNC_A and sync_a exports, and plans as the live mode plan
 ...
 PASS  a failure whose error quotes the workspace prints it with its values hidden  <-- pinned defect
 ...
+PASS  a live --apply without --expect-database is refused before the database is touched  <-- pinned defect
+...
+PASS  an --apply against the wrong database deletes nothing and never reads the version table  <-- pinned defect
+...
+PASS  an --apply on a database platform with no name query is refused, not guessed  <-- pinned defect
+...
+PASS  a name query that returned False is refused, not read as a match  <-- pinned defect
+...
+PASS  an export from the wrong database writes nothing and exits 2  <-- pinned defect
+...
 PASS  an --apply that deletes a non-cp1252 name still reports what it deleted  <-- pinned defect
 ...
 PASS  with two owners of one name, both plans list exactly what --apply deletes  <-- pinned defect
@@ -165,10 +180,10 @@ PASS  a stand-in arcpy is removed afterwards, and a nested one restores the oute
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-327 assertions, 0 failed
+371 assertions, 0 failed
 ```
 
-The full run prints all 327 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 371 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -184,9 +199,10 @@ Which modes need arcpy:
 | Mode | Needs arcpy | Needs a database | Writes |
 |---|---|---|---|
 | `--workspace W` (plan) | yes | yes | nothing |
-| `--workspace W --apply` | yes | yes | deletes versions |
+| `--workspace W --apply --expect-database NAME` | yes | yes | deletes versions, and only from the database `NAME` |
+| `--workspace W --expect-database NAME` (plan) | yes | yes | nothing |
 | `--workspace W --export-versions FILE` | yes | yes | nothing |
-| `--workspace W --export-versions FILE --apply` | yes | yes | `FILE` only, and only when `FILE` is absent or already a snapshot |
+| `--workspace W --export-versions FILE --apply` | yes | yes | `FILE` only, and only when `FILE` is absent or already a snapshot. `--expect-database NAME` is optional here and checked when given. |
 | `--from-versions FILE` | **no** | **no** | nothing, and it refuses `--apply` |
 | `--self-test` | no | no | a temporary folder it deletes again |
 
@@ -195,15 +211,17 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 327 assertions pass on each interpreter it has been run on: CPython 3.13.2, 3.12.10,
-3.11.15 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3 on Ubuntu. On
-Ubuntu the same count also passes under six `TZ` settings, from UTC-11 to UTC+14, because the
-time-zone assertions use an offset that no zone uses. One assertion writes through a dangling
-symbolic link. On a Windows host that cannot create one (no Developer Mode, no admin rights),
-it prints a `SKIP` line instead, and the count is 326. Branch coverage excludes that `SKIP`
-branch with a `pragma: no cover` comment, because a host that can create the link never runs it.
-Branch coverage was measured at 100% on Windows. On Ubuntu, a virtual environment that holds
-`coverage` also measured 100% branch coverage with 327 assertions.
+The same 371 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
+3.12.10, 3.10.20 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3
+on Ubuntu. 3.9 and 3.12 ran with `-W error`. On Ubuntu the same count also passes under three
+`TZ` settings: UTC, UTC-11 and UTC+14. The time-zone assertions use an offset that no zone
+uses. One assertion writes through a dangling symbolic link. On a Windows host that cannot
+create one (no Developer Mode, no admin rights), it prints a `SKIP` line instead, and the count
+is 370. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
+a host that can create the link never runs it. Branch coverage was measured at 100% on Windows
+(1502 statements, 226 branches). On Ubuntu, a virtual environment that holds `coverage` also
+measured 100% branch coverage with 371 assertions. `pyflakes` reports nothing on both hosts, and
+`python -W error` compiles the file without a warning.
 
 The harness checks itself. A probe feeds six known failures through `check()`, `raises()` and
 `refuses()`. If fewer than six are recorded, the run fails even when `check()` itself is broken,
@@ -220,11 +238,15 @@ in memory, prints it, and deletes nothing.
 "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" gdbprune.py --workspace C:\conn\admin.sde
 ```
 
-Once the plan reads correctly, re-run the identical command with `--apply`.
+Once the plan reads correctly, re-run the identical command with `--apply`, and name the
+database the connection must reach. `--apply` refuses to run without `--expect-database`.
 
 ```
-"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" gdbprune.py --workspace C:\conn\admin.sde --apply
+"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" gdbprune.py --workspace C:\conn\admin.sde --apply --expect-database GIS_PROD
 ```
+
+Add the same `--expect-database` to the plan as well. The plan then runs the check too, so a
+plan that reads correctly also shows that the apply will pass the guard.
 
 ### Planning without the database
 
@@ -243,7 +265,7 @@ Anybody can then plan against that file, with any Python and no arcpy:
 ```
 $ python gdbprune.py --from-versions versions.json
 
-gdbprune 1.3.0  [DRY RUN - nothing is deleted]
+gdbprune 1.4.0  [DRY RUN - nothing is deleted]
   snapshot       : versions.json
   exported at    : 2026-10-07T06:15:00  (1 day(s) 14 hour(s) before this run)
   prune pattern  : %SYNC%
@@ -297,7 +319,8 @@ carry the times `01/02/2025 10:00:00 AM` and `2025-01-02 03:04:05 -05:00`. It as
 | `--only-versions A,B` | none | Restrict the run to these versions. Bare or owner-qualified names both work. An empty value (`--only-versions ""`) scopes the run to **nothing**; omit the flag for no scoping. Refused with `--export-versions`. |
 | `--from-versions FILE` | none | Plan from a snapshot file instead of a live workspace. Read-only, no arcpy. |
 | `--export-versions FILE` | none | Write the live version table to `FILE` as a snapshot. Needs arcpy and a workspace. Cannot be combined with `--from-versions`. |
-| `--apply` | **off** | Actually delete, or with `--export-versions` actually write the file. Without it, nothing is deleted or written. |
+| `--expect-database NAME` | none | The exact name of the database the connection must reach, letter case included. **Required with a live `--apply`.** Checked, when given, in a live plan and in `--export-versions`. Refused with `--from-versions`. There is no environment variable for it. See [The wrong-database guard](#the-wrong-database-guard). |
+| `--apply` | **off** | Actually delete, or with `--export-versions` actually write the file. Without it, nothing is deleted or written. A live `--apply` also needs `--expect-database`. |
 | `--allow-replica-anchors` | **off** | Let `SYNC_SEND...` and `SYNC_RECEIVE...` replica system versions be candidates. Without it they are never pruned, whatever the pattern or `--only-versions` says. It never releases a version that a registered replica uses. Refused with `--export-versions`. |
 | `--self-test` | off | Run the built-in assertions and exit. |
 
@@ -327,14 +350,20 @@ there.
   `--prune-days`, a workspace that does not exist, a version table with no `DEFAULT` row, a
   replica list that `arcpy.da.ListReplicas` could not return, or a database error that arcpy
   raises
+- the database guard refused: `--apply` with no `--expect-database`, an `--expect-database`
+  that is empty or has surrounding space, a connected database that is not the one named, a
+  database name the server did not return as one text value, or a database platform with no
+  name query
 
 A half-finished `--apply` is never reported as success.
 
 The two snapshot modes are new in 1.1.0, and they exit `2` when they cannot run: an invalid or
 unreadable snapshot (a schema 1 file included), no arcpy, no workspace, an out-of-range
 `--prune-days`, a version table with no `DEFAULT` row, an export path that holds something
-other than a snapshot, an export path that repeats the workspace string, or
-`--allow-replica-anchors` given to `--export-versions`.
+other than a snapshot, an export path that repeats the workspace string,
+`--allow-replica-anchors` given to `--export-versions`, an `--export-versions` with an
+`--expect-database` that the connected database does not match, or an `--expect-database`
+given to `--from-versions`.
 
 A plan exits `0` whether or not it lists versions to delete. So a scheduled `--from-versions`
 check cannot read "stale versions found" from the exit code. It reads the verdict line,
@@ -356,6 +385,102 @@ does any string with `@` or `://`, such as an EZConnect string (`user/password@h
 because neither has a `KEY=value` form to mask. The `--from-versions` and `--export-versions`
 paths are printed the same way, so a `"$WS"` typed where a file belongs stays hidden. A file
 name that holds `=` is therefore shown masked after the first `=`.
+
+## The wrong-database guard
+
+Picture two connection files in one folder: `prod.sde` and `test.sde`. The test geodatabase
+was restored from production last month, so both hold the same stale `SYNC_` versions, and
+the same plan reads right against either. The cleanup runs against `test.sde` for weeks. Then
+somebody edits the scheduled task and the path points at `prod.sde`. The command is the same,
+the plan is the same, and the exit code is `0`. Nothing in the plan said which database it
+read, so nothing could say it was the wrong one. The versions that go are production's, in the
+middle of a field week.
+
+A live `--apply` therefore needs `--expect-database NAME`. Before it reads the version table
+or deletes anything, gdbprune does this:
+
+1. It asks arcpy what kind of database the connection is. `arcpy.Describe(workspace)`
+   returns `connectionProperties`, and its `dbClient` property is "The database client, for
+   example, sqlserver, db2, oracle, or postgresql"
+   ([Workspace properties](https://pro.arcgis.com/en/pro-app/latest/arcpy/functions/workspace-properties.htm)).
+2. It asks the server for the name of the database the session is on, with
+   `arcpy.ArcSDESQLExecute`:
+
+   | `dbClient` | Query | Source |
+   |---|---|---|
+   | `sqlserver` | `SELECT DB_NAME()` | [DB_NAME](https://learn.microsoft.com/en-us/sql/t-sql/functions/db-name-transact-sql): "If the call to DB_NAME omits database_id, or the database_id is 0, DB_NAME returns the name of the current database." |
+   | `postgresql` | `SELECT current_database()` | [System information functions](https://www.postgresql.org/docs/current/functions-info.html): "Returns the name of the current database." |
+
+   gdbprune reads the name from the server, so the check does not depend on how arcpy reads
+   the connection file. A platform with no query in this table is refused, not guessed at.
+3. It compares that name to `NAME`, exactly. Letter case counts. A name that differs only in
+   letter case is refused, and the refusal says so.
+4. Only then does it read the version table, list the replicas and delete.
+
+Esri documents what `ArcSDESQLExecute.execute` returns
+([ArcSDESQLExecute](https://pro.arcgis.com/en/pro-app/latest/arcpy/classes/arcsdesqlexecute.htm)):
+a list of lists for a statement that returns rows, and `True` or `False` for a statement that
+does not. It adds: "Statements that return a single value from a single row will return the
+value in an appropriate type". gdbprune accepts the bare value, a one-element row and a
+one-row table. It refuses every other result as "no database name": `False`, `True`, `None`,
+an empty list, two columns, two rows, a number, and text with a leading or trailing space or
+an unprintable character.
+
+What the refusals look like. These are real runs against the self-test's stand-in arcpy
+(see Limitation 14). In the second run the stand-in server reports the database `GIS_TEST`.
+In the third it reports `GIS_PROD`.
+
+```
+$ gdbprune.py --workspace prod.sde --apply
+error: --apply needs --expect-database NAME, the exact name of the database the connection must reach. Two connection files can sit side by side, and a version delete runs against whichever one --workspace names. Nothing was read and nothing was deleted.
+exit 1, deleted []
+
+$ gdbprune.py --workspace test.sde --apply --expect-database GIS_PROD
+error: the connection is to database 'GIS_TEST', not the 'GIS_PROD' that --expect-database names. The version table was not read and nothing was deleted. Check that --workspace is the connection file you meant.
+exit 1, deleted []
+```
+
+And a run against the database it expects. The `database` line is new in 1.4.0. A plan or an
+export without `--expect-database` prints `database       : not checked (no --expect-database
+was given)` in its place.
+
+```
+$ gdbprune.py --workspace prod.sde --apply --expect-database GIS_PROD
+
+gdbprune 1.4.0  [APPLY - versions are being deleted]
+  workspace      : prod.sde
+  database       : GIS_PROD  (matches --expect-database)
+  prune pattern  : %SYNC%
+  older than     : 7 day(s)  (created before 2026-11-03 20:46:30)
+  ...
+  pass 1  -  1 leaf version(s)
+      gisowner.SYNC_FIELD_0802
+  pass 2  -  1 leaf version(s)
+      gisowner.SYNC_FIELD_0801
+
+  2 version(s) deleted across 2 pass(es).
+exit 0, deleted ['gisowner.SYNC_FIELD_0802', 'gisowner.SYNC_FIELD_0801']
+```
+
+Rules that follow from this:
+
+- **A plan can run the check too.** `--expect-database` without `--apply` does the same
+  steps, then prints the plan and deletes nothing. A wrong name refuses the plan, so a dry run
+  with the flag previews whether the apply will pass.
+- **There is no environment variable for it.** `SDE_MAINTENANCE_WORKSPACE` sets the connection.
+  If another variable set the expected name, one wrapper script could set both from the same
+  wrong source, and the check would then agree with whatever it was meant to catch. The name
+  has to be typed in the command, next to the connection file.
+- **An export checks it when given.** `--export-versions` only writes a file, so the flag is
+  optional there. When it is given and wrong, nothing is written and the run exits `2`.
+- **A snapshot has no database to check.** `--from-versions` reads a file, so it refuses
+  `--expect-database` with exit `2` instead of ignoring a check the caller thinks ran.
+- **The name is checked once per run, before the first read.** The version table is re-read
+  after every pass, and the check is not repeated.
+- **The names are not secrets, but they are escaped.** The database name prints through the
+  same ASCII escape as every other name. An `--expect-database` that holds `KEY=value` text,
+  such as a connection string pasted by mistake, is masked in the refusal.
+- **The flag is spelled in full.** `--expect` is a usage error with exit `2`, as `--ap` is.
 
 ## The snapshot file
 
@@ -816,7 +941,7 @@ Real refusals, not a wishlist.
       young or still pinned by a child. It can be larger than the number the plan deletes.
     - On a stand-in table of 100,000 versions with chains 50 deep, a dry run took about 12
       seconds of CPU. A live run adds one table read and one `ListReplicas` call per pass.
-    - The self-test was run on CPython 3.9.25, 3.11.15, 3.12.10 and 3.13.2 and on ArcGIS Pro's
+    - The self-test was run on CPython 3.9.25, 3.10.20, 3.12.10 and 3.13.2 and on ArcGIS Pro's
       Python 3.13.7 on Windows, and on CPython 3.12.3 on Linux. No other release was run.
     - Other local users can see a connection-string `--workspace` in the process list while
       the run lasts. Use an `.sde` file or `SDE_MAINTENANCE_WORKSPACE` instead.
@@ -872,6 +997,30 @@ Real refusals, not a wishlist.
     - The self-test label `the written file holds no connection string, host, connecting user or
       password` is narrower than it reads. The file can name the connecting account when that
       account owns a version, and the assertion uses an account that owns none.
+
+14. **The database guard compares one name, once, and has only run against a stand-in.**
+    - No geodatabase was available for this release. The guard was exercised through the
+      self-test's stand-in `arcpy` module, which returns what Esri's pages say the real calls
+      return. It was not run against a SQL Server or PostgreSQL geodatabase. If `dbClient`
+      has another spelling on a real connection, or `DB_NAME()` comes back in another shape,
+      the guard refuses and the run exits `1`. It does not delete. Run the plan with
+      `--expect-database` first.
+    - A database name is not unique across servers. A production server and a test server can
+      each hold a database named `GIS`, and the guard passes both. It proves the name, not the
+      host. Give the two databases different names, or check the host in the connection file.
+    - The name is checked once, before the first read. Each delete then opens the connection
+      file again through `arcpy.management.DeleteVersion`. A connection file that is replaced
+      during the run is not caught.
+    - Only `sqlserver` and `postgresql` have a query. An Oracle or Db2 geodatabase is refused
+      with exit `1`, so its `--apply` cannot run with this release.
+    - The comparison is exact, whatever the server's collation. If a server accepts two
+      spellings of one database name, the guard accepts only the spelling the server returns.
+      Retype the flag with the case the refusal prints.
+    - The snapshot file does not record which database it came from. A plan from an old
+      snapshot of the wrong database is not caught. It cannot delete, so this costs a wrong
+      reading, not a wrong delete.
+    - `--prune-days`, `--prune-pattern` and `--only-versions` are validated before the guard
+      runs. A bad value refuses the run before the database is touched, as it did before.
 
 ## Contributing
 

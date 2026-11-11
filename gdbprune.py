@@ -22,13 +22,20 @@ WHY LEAF-FIRST
 
 MODES
     --workspace W                 plan against the live table       (arcpy)
-    --workspace W --apply         delete, leaf first                (arcpy)
+    --workspace W --apply --expect-database NAME
+                                  delete, leaf first, only when the
+                                  server names NAME as its database (arcpy)
     --workspace W --export-versions OUT.json [--apply]
                                   write a version snapshot; the file
                                   is written only under --apply     (arcpy)
     --from-versions FILE.json     plan from a snapshot. Read-only,
                                   refuses --apply, never imports arcpy
     --self-test                   the assertions below              (none)
+    --expect-database NAME        refuse unless the connected database is
+                                  NAME. Required with a live --apply. Also
+                                  checked, when given, in a live plan and in
+                                  --export-versions; refused with
+                                  --from-versions
     --allow-replica-anchors       let SYNC_SEND / SYNC_RECEIVE replica
                                   system versions be candidates. Off by
                                   default
@@ -74,6 +81,17 @@ SAFETY
     never candidates, whatever the pattern, unless --allow-replica-anchors
     is given. Flags cannot be abbreviated.
 
+    Two connection files can sit side by side, one per database, and a
+    version delete runs against whichever one the command names. A live
+    --apply therefore needs --expect-database NAME. Before it reads the
+    version table or deletes anything, the tool asks the server for the name
+    of the database it is connected to (SELECT DB_NAME() on SQL Server,
+    SELECT current_database() on PostgreSQL, chosen by the dbClient property
+    that arcpy.Describe reports) and compares it to NAME, exactly and with
+    letter case. A name that differs, a name that cannot be read, or a
+    database platform with no query here is a refusal: exit 1 and nothing
+    deleted.
+
     python gdbprune.py --self-test     # no arcpy, no network, no credentials
 """
 
@@ -92,7 +110,7 @@ import types
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # --------------------------------------------------------------------------
 # CONFIGURATION - tunables that are deliberately not command-line flags.
@@ -127,6 +145,17 @@ VERSION_TABLE = "sde.SDE_versions"
 # PruneResult.converged False, prints INCOMPLETE, and exits 1 - a version
 # chain deeper than this needs a second run, not a silent truncation.
 MAX_PASSES = 100
+
+# SQL that returns the name of the database the connection is using, by the
+# dbClient value that arcpy.Describe(...).connectionProperties reports.
+# SQL Server: DB_NAME() with no argument is the current database (Microsoft
+# Learn, DB_NAME). PostgreSQL: current_database() (PostgreSQL manual, system
+# information functions). No other platform has a query here, so a database
+# on one is refused rather than guessed at.
+DATABASE_QUERIES = {
+    "sqlserver": "SELECT DB_NAME()",
+    "postgresql": "SELECT current_database()",
+}
 
 # Interpreter that ships arcpy. Named in the ModuleNotFoundError message.
 PRO_PYTHON = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"
@@ -512,6 +541,47 @@ def prune(
 
 
 # --------------------------------------------------------------------------
+# Database guard - pure. verify_database() asks the server; these decide.
+# --------------------------------------------------------------------------
+
+
+def database_query(db_client):
+    """The SQL that names the connected database for this dbClient value, or
+    None when the platform has no query. Compared without letter case."""
+    return DATABASE_QUERIES.get(str(db_client or "").strip().lower())
+
+
+def database_name_from(result):
+    """The database name in an ArcSDESQLExecute result, or None.
+
+    Esri: the method returns a list of lists for a statement that returns
+    rows, True or False for one that does not, and the bare value for a
+    statement that returns one value from one row. All of [[x]], [x] and x
+    are unwrapped. Anything that is not exactly one printable, trimmed text
+    value is None, so a failed query (False), an empty one ([]) and two
+    columns or two rows can never pass for a name."""
+    for _ in range(2):
+        if isinstance(result, (list, tuple)) and len(result) == 1:
+            result = result[0]
+    return result if _clean_text(result) else None
+
+
+def check_database(expected, actual):
+    """None when the connected database is the one the caller named, else the
+    refusal text. The comparison is exact, letter case included: a case-
+    sensitive server can hold two databases whose names differ only by case,
+    and a refusal that is too strict costs a retyped flag."""
+    if actual == expected:
+        return None
+    text = ("the connection is to database %r, not the %r that --expect-database names"
+            % (actual, redact(expected)))
+    if actual.lower() == expected.lower():
+        text += " (the names differ only in letter case, and the comparison is exact)"
+    return (text + ". The version table was not read and nothing was deleted. Check that --workspace is "
+            "the connection file you meant.")
+
+
+# --------------------------------------------------------------------------
 # Version snapshot - pure. build_snapshot() and dump_snapshot() make the
 # text --export-versions writes; parse_snapshot() is the strict reader that
 # --from-versions feeds into prune().
@@ -752,6 +822,36 @@ def _coerce_datetime(value):
         return None
 
 
+def _require_workspace(arcpy, workspace):
+    if not arcpy.Exists(workspace):
+        raise ToolError("workspace does not exist or is not readable: %s" % redact(workspace))
+
+
+def verify_database(workspace, expected):
+    """Return the connected database's name, or raise ToolError unless it is
+    `expected`. Asks the server, not the connection file: the file only says
+    which database it was made for. Reads nothing else, so a refusal leaves
+    the version table unread and every version in place."""
+    arcpy = _import_arcpy()
+    _require_workspace(arcpy, workspace)
+    props = getattr(arcpy.Describe(workspace), "connectionProperties", None)
+    db_client = getattr(props, "dbClient", None)
+    query = database_query(db_client)
+    if query is None:
+        raise ToolError(
+            "cannot read the database name: the connection reports database platform %r, and "
+            "--expect-database supports %s. The version table was not read and nothing was deleted."
+            % (db_client, ", ".join(sorted(DATABASE_QUERIES))))
+    actual = database_name_from(arcpy.ArcSDESQLExecute(workspace).execute(query))
+    if actual is None:
+        raise ToolError("cannot read the database name: %r returned no single text value. "
+                        "The version table was not read and nothing was deleted." % query)
+    problem = check_database(expected, actual)
+    if problem is not None:
+        raise ToolError(problem)
+    return actual
+
+
 def fetch_versions(workspace):
     """Read the entire traditional version table as version dicts.
 
@@ -760,8 +860,7 @@ def fetch_versions(workspace):
     pushed into this query.
     """
     arcpy = _import_arcpy()
-    if not arcpy.Exists(workspace):
-        raise ToolError("workspace does not exist or is not readable: %s" % redact(workspace))
+    _require_workspace(arcpy, workspace)
 
     sql = arcpy.ArcSDESQLExecute(workspace)
     rows = sql.execute(
@@ -872,14 +971,26 @@ def redact(text):
     return re.sub(r"=[^;]*", "=***", text)
 
 
-def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=None):
+def _database_line(database):
+    """The `database` line of a live report: the verified name, or the fact
+    that no name was checked. The name is the server's own answer, so it is
+    escaped to ASCII by _say() like every other name."""
+    if database is None:
+        return "not checked (no --expect-database was given)"
+    return "%s  (matches --expect-database)" % database
+
+
+def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=None,
+               database=None):
     """Print a prune plan. With `exported_at` the plan came from a snapshot
-    file, and the export time is printed in the header and the verdict."""
+    file, and the export time is printed in the header and the verdict.
+    `database` is the name verify_database() returned for a live run."""
     header = "APPLY - versions are being deleted" if applied else "DRY RUN - nothing is deleted"
     _say("")
     _say("gdbprune %s  [%s]" % (__version__, header))
     if exported_at is None:
         _say("  workspace      : %s" % redact(workspace))
+        _say("  database       : %s" % _database_line(database))
     else:
         _say("  snapshot       : %s" % redact(workspace))
         _say("  exported at    : %s  (%s)"
@@ -966,11 +1077,12 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
     _say("")
 
 
-def print_export(workspace, out_path, snapshot, text, applied, undated):
+def print_export(workspace, out_path, snapshot, text, applied, undated, database=None):
     header = "EXPORT - writing the snapshot" if applied else "EXPORT DRY RUN - nothing is written"
     _say("")
     _say("gdbprune %s  [%s]" % (__version__, header))
     _say("  workspace      : %s" % redact(workspace))
+    _say("  database       : %s" % _database_line(database))
     _say("  output         : %s" % redact(out_path))
     _say("  exported at    : %s" % snapshot["exported_at"])
     _say("  versions read  : %d" % len(snapshot["versions"]))
@@ -990,6 +1102,10 @@ def print_export(workspace, out_path, snapshot, text, applied, undated):
 # Self-test - pure Python, no arcpy, no network, no credentials. The arcpy
 # paths run against an in-memory stand-in module; see _FakeGdb.
 # --------------------------------------------------------------------------
+
+
+# The database name the stand-in server reports unless a test says otherwise.
+FIXTURE_DB = "GIS_PROD"
 
 
 def _v(name, parent=None, owner="gisowner", age_days=30):
@@ -1036,12 +1152,19 @@ class _FakeGdb(object):
     re-read after an applied pass sees the smaller tree, as a database would.
     """
 
-    def __init__(self, rows, exists=True, locked=(), replicas=()):
+    def __init__(self, rows, exists=True, locked=(), replicas=(), database=FIXTURE_DB,
+                 db_client="sqlserver"):
         self.rows = [list(r) for r in rows]
         self.replicas = replicas
         self.sql = []
+        self.events = []  # every call that reaches the server, in order
         self.deleted = []
         self.answer = lambda: [list(r) for r in self.rows]
+        # What the database-name query returns. SQL Server's DB_NAME() is a
+        # single value from a single row, which ArcSDESQLExecute hands back
+        # as the bare value.
+        self.db_answer = lambda: database
+        self.db_client = db_client
         gdb = self
 
         class _SQL(object):
@@ -1049,7 +1172,11 @@ class _FakeGdb(object):
                 gdb.sql.append(("connect", workspace))
 
             def execute(self, statement):
+                if statement in DATABASE_QUERIES.values():
+                    gdb.events.append(("database", statement))
+                    return gdb.db_answer()
                 gdb.sql.append(("execute", statement))
+                gdb.events.append(("read", statement))
                 return gdb.answer()
 
         def delete_version(workspace, name):
@@ -1057,6 +1184,7 @@ class _FakeGdb(object):
                 # Quotes the workspace, as a real DeleteVersion error can.
                 raise RuntimeError("version is locked by another session on %s" % workspace)
             gdb.deleted.append(name)
+            gdb.events.append(("delete", name))
             gdb.rows = [r for r in gdb.rows
                         if qualified_name({"name": r[0], "owner": r[2]}) != name]
 
@@ -1076,6 +1204,8 @@ class _FakeGdb(object):
             return [types.SimpleNamespace(version=v) for v in gdb.replicas]
 
         self.module.da = types.SimpleNamespace(ListReplicas=list_replicas)
+        self.module.Describe = lambda path: types.SimpleNamespace(
+            connectionProperties=types.SimpleNamespace(dbClient=gdb.db_client))
 
 
 def _with_module(name, module, fn):
@@ -1152,6 +1282,9 @@ def self_test():
         else:
             check(False, "%s (no error raised)" % label)
 
+    # The flag a live --apply cannot run without. FIXTURE_DB is what the
+    # stand-in server reports, so these runs pass the guard.
+    GUARD = ("--expect-database", FIXTURE_DB)
     NOW = datetime(2026, 1, 1, 12, 0, 0)
     CUTOFF = NOW - timedelta(days=7)
     M = compile_like_pattern("%SYNC%")
@@ -2234,7 +2367,7 @@ def self_test():
               and "Re-run with --apply" in out,
               "the live plan mode deletes nothing and says how to apply")
         gdb = _FakeGdb(live_rows)
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_C", "gisowner.SYNC_B",
                                             "gisowner.SYNC_A"]
               and "APPLY - versions are being deleted" in out and "DRY RUN" not in out,
@@ -2242,12 +2375,12 @@ def self_test():
         check(len([s for s in gdb.sql if s[0] == "execute"]) == 4,
               "--apply re-reads the version table after every pass")
         gdb = _FakeGdb(live_rows, locked=("gisowner.SYNC_C",))
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and "1 failure(s):" in out and "version is locked" in out
               and gdb.deleted == [],
               "a locked leaf exits 1, is reported, and pins its whole chain")
         gdb = _FakeGdb(live_rows, locked=("gisowner.SYNC_C",))
-        code, out = _run_cli(["--workspace", secret_ws, "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", secret_ws, "--apply", *GUARD], gdb.module)
         check(code == 1 and "version is locked" in out
               and not any(s in out for s in ("db-host-01", "sde_admin", "hunter2")),
               "a failure whose error quotes the workspace prints it with its values hidden"
@@ -2267,7 +2400,7 @@ def self_test():
               and "--from-versions" in out,
               "with no workspace anywhere the tool refuses and names the offline mode")
         gdb = _FakeGdb(live_rows)
-        code, out = _run_cli(["--workspace", "conn", "--prune-pattern", "%'x", "--apply"],
+        code, out = _run_cli(["--workspace", "conn", "--prune-pattern", "%'x", "--apply", *GUARD],
                              gdb.module)
         check(code == 1 and gdb.sql == [],
               "a bad pattern is refused before the database is touched")
@@ -2281,6 +2414,220 @@ def self_test():
         check(code == 2 and "arcpy is not available" in out,
               "--export-versions needs arcpy and says so")
 
+        # ---- the wrong-database guard -----------------------------------------
+        # Two connection files sit side by side, one per database, and the
+        # command names the wrong one. The decision core first, then the CLI.
+        check(database_query("sqlserver") == "SELECT DB_NAME()"
+              and database_query(" SQLServer ") == "SELECT DB_NAME()",
+              "a SQL Server connection is asked SELECT DB_NAME(), whatever the case of dbClient")
+        check(database_query("postgresql") == "SELECT current_database()",
+              "a PostgreSQL connection is asked SELECT current_database()")
+        check(all(database_query(x) is None for x in ("oracle", "db2", "", None)),
+              "a platform with no name query here, or no platform at all, gets none")
+        check([database_name_from(x) for x in ("GIS_A", ["GIS_A"], [["GIS_A"]], (("GIS_A",),))]
+              == ["GIS_A"] * 4,
+              "the database name is unwrapped from a bare value, a row and a table")
+        not_names = (True, False, None, [], [[]], [["a", "b"]], [["a"], ["b"]], ["a", "b"], "",
+                     " GIS", "GIS ", 7, [[7]], "G\x00")
+        check(all(database_name_from(x) is None for x in not_names),
+              "a failed query, an empty one, two values and a non-text value are no database"
+              " name  <-- pinned defect")
+        check(check_database("GIS_PROD", "GIS_PROD") is None,
+              "the connected database is accepted when it is the one named")
+        refusal = check_database("GIS_PROD", "GIS_TEST")
+        check("'GIS_TEST'" in refusal and "'GIS_PROD'" in refusal
+              and "version table was not read" in refusal and "letter case" not in refusal,
+              "a different database name is refused, and the refusal names both")
+        check("differ only in letter case" in check_database("gis_prod", "GIS_PROD"),
+              "a name that differs only in letter case is refused, and says so"
+              "  <-- pinned defect")
+        check("hunter2" not in check_database("SERVER=h;PWD=hunter2", "GIS_TEST"),
+              "a connection string typed as the expected name is masked in the refusal"
+              "  <-- pinned defect")
+
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        check(code == 1 and "--apply needs --expect-database" in out and gdb.events == []
+              and gdb.sql == [] and gdb.deleted == [],
+              "a live --apply without --expect-database is refused before the database is"
+              " touched  <-- pinned defect")
+        gdb = _FakeGdb(live_rows)
+        os.environ[ENV_WORKSPACE] = "env-conn"
+        code, out = _run_cli(["--apply"], gdb.module)
+        os.environ.pop(ENV_WORKSPACE, None)
+        check(code == 1 and "--apply needs --expect-database" in out and gdb.events == []
+              and gdb.deleted == [],
+              "the workspace variable does not stand in for --expect-database  <-- pinned defect")
+
+        gdb = _FakeGdb(live_rows, database="GIS_TEST")
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_PROD"],
+                             gdb.module)
+        check(code == 1 and "'GIS_TEST', not the 'GIS_PROD'" in out and gdb.deleted == []
+              and gdb.events == [("database", "SELECT DB_NAME()")] and "APPLY" not in out
+              and gdb.sql == [("connect", "conn")],
+              "an --apply against the wrong database deletes nothing and never reads the version"
+              " table  <-- pinned defect")
+        gdb = _FakeGdb(live_rows, database="Gis_Prod")
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_PROD"],
+                             gdb.module)
+        check(code == 1 and "differ only in letter case" in out and gdb.deleted == [],
+              "an --apply against a database named in another letter case is refused"
+              "  <-- pinned defect")
+
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_PROD"],
+                             gdb.module)
+        kinds = [e[0] for e in gdb.events]
+        check(code == 0 and gdb.deleted == ["gisowner.SYNC_C", "gisowner.SYNC_B",
+                                            "gisowner.SYNC_A"]
+              and "database       : GIS_PROD  (matches --expect-database)" in out
+              and "APPLY - versions are being deleted" in out,
+              "an --apply against the database it expects deletes and names the database")
+        check(kinds[0] == "database" and kinds.count("database") == 1
+              and kinds.index("read") < kinds.index("delete"),
+              "the database is asked first and once, before the version table and any delete")
+
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--workspace", "conn"], gdb.module)
+        check(code == 0 and "database       : not checked (no --expect-database was given)" in out
+              and not any(e[0] == "database" for e in gdb.events),
+              "a live plan without --expect-database says it did not check, and asks nothing")
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--workspace", "conn", "--expect-database", "GIS_PROD"], gdb.module)
+        check(code == 0 and "database       : GIS_PROD  (matches --expect-database)" in out
+              and "DRY RUN" in out and gdb.deleted == [],
+              "a live plan with --expect-database checks it and still deletes nothing")
+        gdb = _FakeGdb(live_rows, database="GIS_TEST")
+        code, out = _run_cli(["--workspace", "conn", "--expect-database", "GIS_PROD"], gdb.module)
+        check(code == 1 and "not the 'GIS_PROD'" in out and "DRY RUN" not in out
+              and gdb.events == [("database", "SELECT DB_NAME()")],
+              "a dry run with the wrong --expect-database is refused, so it previews the apply")
+
+        for client in ("postgresql", "PostgreSQL"):
+            gdb = _FakeGdb(live_rows, db_client=client, database="gis_pg")
+            code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "gis_pg"],
+                                 gdb.module)
+            check(code == 0 and gdb.events[0] == ("database", "SELECT current_database()")
+                  and len(gdb.deleted) == 3,
+                  "a PostgreSQL connection (dbClient %s) is checked with current_database()"
+                  % client)
+        gdb = _FakeGdb(live_rows, db_client="postgresql", database="gis_pg_test")
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "gis_pg"],
+                             gdb.module)
+        check(code == 1 and gdb.deleted == [] and len(gdb.events) == 1,
+              "an --apply against the wrong PostgreSQL database deletes nothing")
+        gdb = _FakeGdb(live_rows, db_client="oracle")
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_PROD"],
+                             gdb.module)
+        check(code == 1 and "database platform 'oracle'" in out and gdb.deleted == []
+              and gdb.events == [],
+              "an --apply on a database platform with no name query is refused, not guessed"
+              "  <-- pinned defect")
+        gdb = _FakeGdb(live_rows)
+        gdb.module.Describe = lambda path: types.SimpleNamespace()
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_PROD"],
+                             gdb.module)
+        check(code == 1 and "database platform None" in out and gdb.deleted == []
+              and gdb.events == [],
+              "a connection that reports no properties is refused, not a crash"
+              "  <-- pinned defect")
+
+        # ArcSDESQLExecute returns False for a statement that failed, and any
+        # list for a statement that returned rows. None of these is a name.
+        for answer in (False, True, None, [], [["GIS_PROD", "GIS_PROD"]],
+                       [["GIS_PROD"], ["GIS_TEST"]], 42):
+            gdb = _FakeGdb(live_rows)
+            gdb.db_answer = lambda answer=answer: answer
+            code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database",
+                                  "GIS_PROD"], gdb.module)
+            check(code == 1 and "cannot read the database name" in out and gdb.deleted == []
+                  and not any(e[0] == "read" for e in gdb.events),
+                  "a name query that returned %r is refused, not read as a match"
+                  "  <-- pinned defect" % (answer,))
+
+        gdb = _FakeGdb(live_rows)
+
+        def login_failed():
+            raise RuntimeError("login failed for %s" % secret_ws)
+
+        gdb.db_answer = login_failed
+        code, out = _run_cli(["--workspace", secret_ws, "--apply", "--expect-database",
+                              "GIS_PROD"], gdb.module)
+        check(code == 1 and "error: RuntimeError: login failed" in out and gdb.deleted == []
+              and not any(s in out for s in ("hunter2", "sde_admin", "db-host-01")),
+              "a name query that raises exits 1 with its text redacted and deletes nothing"
+              "  <-- pinned defect")
+
+        for bad in ("", " GIS_PROD", "GIS_PROD\n"):
+            gdb = _FakeGdb(live_rows)
+            code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", bad],
+                                 gdb.module)
+            check(code == 1 and "--expect-database must be a database name" in out
+                  and gdb.events == [] and gdb.sql == [],
+                  "--expect-database %r is refused before the database is touched"
+                  "  <-- pinned defect" % (bad,))
+        gdb = _FakeGdb(live_rows, database="GIS_TEST")
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database",
+                              "SERVER=db-host-01;PWD=hunter2"], gdb.module)
+        check(code == 1 and "hunter2" not in out and "not the 'SERVER=***;PWD=***'" in out,
+              "a connection string typed as --expect-database is masked in the refusal"
+              "  <-- pinned defect")
+
+        wide_db = "GIS_\u4e2d"
+        gdb = _FakeGdb(live_rows, database=wide_db)
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", wide_db],
+                             gdb.module, encoding="cp1252")
+        check(code == 0 and "GIS_\\u4e2d  (matches" in out,
+              "a database name outside cp1252 prints escaped to a cp1252 stdout, not a crash")
+        gdb = _FakeGdb(live_rows, database=wide_db)
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_X"],
+                             gdb.module, encoding="cp1252")
+        check(code == 1 and "'GIS_\\u4e2d', not the 'GIS_X'" in out and gdb.deleted == [],
+              "a refusal that names a non-cp1252 database prints escaped, not a crash")
+
+        code, out = _run_cli(["--workspace", "gone", "--apply", "--expect-database", "GIS_PROD"],
+                             _FakeGdb(live_rows, exists=False).module)
+        check(code == 1 and "does not exist" in out,
+              "the database guard refuses a workspace arcpy cannot see")
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect-database", "GIS_PROD"],
+                             None)
+        check(code == 1 and "arcpy is not available" in out,
+              "the database guard needs arcpy and says so")
+
+        guard_path = os.path.join(tmp, "guard-export.json")
+        gdb = _FakeGdb(live_rows, database="GIS_TEST")
+        code, out = _run_cli(["--export-versions", guard_path, "--workspace", "conn", "--apply",
+                              "--expect-database", "GIS_PROD"], gdb.module)
+        check(code == 2 and "not the 'GIS_PROD'" in out and not os.path.exists(guard_path)
+              and gdb.events == [("database", "SELECT DB_NAME()")],
+              "an export from the wrong database writes nothing and exits 2  <-- pinned defect")
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--export-versions", guard_path, "--workspace", "conn", "--apply",
+                              "--expect-database", "GIS_PROD"], gdb.module)
+        check(code == 0 and os.path.exists(guard_path)
+              and "database       : GIS_PROD  (matches --expect-database)" in out,
+              "an export from the database it expects is written and names the database")
+        os.remove(guard_path)
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--export-versions", guard_path, "--workspace", "conn", "--apply"],
+                             gdb.module)
+        check(code == 0 and os.path.exists(guard_path)
+              and "database       : not checked (no --expect-database was given)" in out
+              and not any(e[0] == "database" for e in gdb.events),
+              "an export needs no --expect-database, and says the database was not checked")
+
+        code, out = _run_cli(["--from-versions", snap_path, "--expect-database", "GIS_PROD"],
+                             None)
+        check(code == 2 and "has no database to check" in out,
+              "--from-versions refuses --expect-database rather than ignore a check"
+              "  <-- pinned defect")
+        gdb = _FakeGdb(live_rows)
+        code, out = _run_cli(["--workspace", "conn", "--apply", "--expect", "GIS_PROD"],
+                             gdb.module)
+        check(code == 2 and "unrecognized arguments: --expect" in out and gdb.events == [],
+              "a prefix of --expect-database is a usage error, and nothing is read"
+              "  <-- pinned defect")
+
         # live mode: credentials, names outside cp1252, qualified parents
         code, out = _run_cli(["--workspace", secret_ws], _FakeGdb(live_rows).module)
         check(code == 0 and "hunter2" not in out and "sde_admin" not in out
@@ -2291,7 +2638,7 @@ def self_test():
         check(code == 1 and "does not exist" in out and "hunter2" not in out,
               "the missing-workspace error hides the password too")
         gdb = _FakeGdb(wide_rows)
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module, encoding="cp1252")
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module, encoding="cp1252")
         check(code == 0 and gdb.deleted == ['"DOMAIN\\\u0141ukasz".SYNC_\u4e2d']
               and "1 version(s) deleted across 1 pass(es)." in out,
               "an --apply that deletes a non-cp1252 name still reports what it deleted"
@@ -2299,12 +2646,12 @@ def self_test():
         gdb = _FakeGdb([["DEFAULT", None, "sde", "2020-01-01 00:00:00"],
                         ["SYNC_P", "DEFAULT", "gisowner", "2025-01-01 00:00:00"],
                         ["SYNC_KID", "gisowner.SYNC_P", "gisowner", real_now]])
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 0 and gdb.deleted == [],
               "a live parent named owner-qualified by its child is never deleted"
               "  <-- pinned defect")
         gdb = _FakeGdb(live_rows)
-        code, out = _run_cli(["--workspace", "conn", "--prune-days", "1000000", "--apply"],
+        code, out = _run_cli(["--workspace", "conn", "--prune-days", "1000000", "--apply", *GUARD],
                              gdb.module)
         check(code == 1 and gdb.sql == [] and "before the year 1" in out,
               "an out-of-range --prune-days is refused before the database is touched")
@@ -2320,7 +2667,7 @@ def self_test():
             _versions_from_rows(twin_rows), real_now)))
         code_snap, out_snap = _run_cli(["--from-versions", twin_path], None)
         gdb = _FakeGdb(twin_rows)
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code_plan == code_snap == code == 0 and gdb.deleted == ["crew1.SYNC_X"]
               and pass_lines(out_plan) == pass_lines(out_snap) == pass_lines(out)
               == ["  pass 1  -  1 leaf version(s)", "      crew1.SYNC_X"],
@@ -2329,7 +2676,7 @@ def self_test():
 
         # The live --apply exit code for a run cut off at the pass limit.
         gdb = _FakeGdb(deep_rows)
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and "INCOMPLETE" in out and len(gdb.deleted) == MAX_PASSES
               and len(gdb.rows) == 2,
               "an --apply cut off at the pass limit exits 1, not 0  <-- pinned defect")
@@ -2381,7 +2728,7 @@ def self_test():
         # A table read with no DEFAULT row is refused in the live mode too.
         gdb = _FakeGdb([])
         gdb.answer = lambda: True
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and "no DEFAULT version" in out and "nothing to prune" not in out,
               "a live run over a query that returned no rows is refused, not planned clean"
               "  <-- pinned defect")
@@ -2393,7 +2740,7 @@ def self_test():
               "a table of unreadable creation times plans nothing, says 2 are undated and"
               " exits 1  <-- pinned defect")
         gdb = _FakeGdb(undated_live)
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and gdb.deleted == [] and "UNDATED: 2 matching" in out,
               "an --apply that could date no matching version exits 1, not 0  <-- pinned defect")
 
@@ -2412,7 +2759,7 @@ def self_test():
             return first_read()
 
         gdb.answer = reread_fails
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and gdb.deleted == ["gisowner.SYNC_B"]
               and "STOPPED: re-reading the version table after pass 1 failed" in out
               and "      gisowner.SYNC_B" in out and "1 version(s) deleted" in out
@@ -2432,7 +2779,7 @@ def self_test():
             return first_list(workspace, all_replicas)
 
         gdb.module.da.ListReplicas = relist_fails
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and gdb.deleted == ["gisowner.SYNC_B"]
               and "STOPPED: re-reading the version table after pass 1 failed" in out
               and "      gisowner.SYNC_B" in out and "ListReplicas failed" in out,
@@ -2457,7 +2804,7 @@ def self_test():
                 sys.stdout, sys.stderr = full, err
                 try:
                     code = _with_module("arcpy", gdb.module,
-                                        lambda: main(["--workspace", "conn", "--apply"]))
+                                        lambda: main(["--workspace", "conn", "--apply", *GUARD]))
                 finally:
                     sys.stdout, sys.stderr = saved
                 check(code == 1 and len(gdb.deleted) == 2
@@ -2535,7 +2882,7 @@ def self_test():
               and "NOT LIKE" not in out,
               "--allow-replica-anchors plans the anchors and says it allowed them")
         gdb = _FakeGdb(anchor_rows)
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_01"],
               "a live --apply deletes no anchor without the flag  <-- pinned defect")
         gdb = _FakeGdb(anchor_rows)
@@ -2550,7 +2897,7 @@ def self_test():
               "an anchor a replica uses is counted as in use, not as one the flag can prune"
               "  <-- pinned defect")
         gdb = _FakeGdb(anchor_rows)
-        code, out = _run_cli(["--workspace", "conn", "--apply", "--allow-replica-anchors"],
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD, "--allow-replica-anchors"],
                              gdb.module)
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_01", "sde.SYNC_RECEIVE_7_2",
                                             "sde.SYNC_SEND_7_1", "sde.SYNC_SEND_7_0"],
@@ -2587,7 +2934,7 @@ def self_test():
                                                    "sde.Esri_Anonymous_WaterSync"])
 
         gdb = in_use_gdb()
-        code, out = _run_cli(["--workspace", "conn", "--apply", "--allow-replica-anchors"],
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD, "--allow-replica-anchors"],
                              gdb.module)
         check(code == 0 and gdb.deleted == ["gisowner.SYNC_FIELD_02"]
               and "replica in use : 3 matching" in out and ("replicas", True) in gdb.sql,
@@ -2595,7 +2942,7 @@ def self_test():
               " the flag  <-- pinned defect")
         gdb = in_use_gdb()
         gdb.replicas = RuntimeError("cannot list replicas on SERVER=db-host-01;PASSWORD=hunter2")
-        code, out = _run_cli(["--workspace", "conn", "--apply"], gdb.module)
+        code, out = _run_cli(["--workspace", "conn", "--apply", *GUARD], gdb.module)
         check(code == 1 and gdb.deleted == [] and "hunter2" not in out
               and "cannot list replicas" in out,
               "a run that cannot list the replicas deletes nothing and exits 1  <-- pinned defect")
@@ -2777,6 +3124,16 @@ def build_parser():
              "Bare or owner-qualified names both work. An empty value scopes "
              "the run to nothing; omit the flag entirely for no scoping.",
     )
+    p.add_argument(
+        "--expect-database",
+        metavar="NAME",
+        help="The exact name of the database the connection must reach. Required with a "
+             "live --apply. Before it reads the version table or deletes anything, the "
+             "tool asks the server for the connected database's name (SQL Server and "
+             "PostgreSQL) and refuses unless it equals NAME, letter case included. Also "
+             "checked in a live plan and in --export-versions when given. Refused with "
+             "--from-versions: a file has no database to check.",
+    )
     mode = p.add_mutually_exclusive_group()
     mode.add_argument(
         "--from-versions",
@@ -2820,6 +3177,9 @@ def run_from_versions(args, now, cutoff):
         )
     if args.workspace:
         raise ToolError("--from-versions reads a file, not a workspace. Drop --workspace.")
+    if args.expect_database is not None:
+        raise ToolError("--from-versions reads a file, and a file has no database to check. "
+                        "Drop --expect-database.")
     try:
         exported_at, versions = read_snapshot(args.from_versions)
     except SnapshotError as exc:
@@ -2844,7 +3204,7 @@ def run_from_versions(args, now, cutoff):
     return 1 if (not result.converged or result.undated) else 0
 
 
-def run_export(args, workspace, now):
+def run_export(args, workspace, now, database=None):
     """Write the live version table as a snapshot, under --apply only."""
     if args.only_versions is not None:
         raise ToolError(
@@ -2891,7 +3251,8 @@ def run_export(args, workspace, now):
     matcher = compile_like_pattern(args.prune_pattern)
     undated = sum(1 for v in versions
                   if _matches(v, matcher, None) and local_naive(v.get("created")) is None)
-    print_export(workspace, args.export_versions, snapshot, text, bool(args.apply), undated)
+    print_export(workspace, args.export_versions, snapshot, text, bool(args.apply), undated,
+                 database)
     return 0
 
 
@@ -2954,8 +3315,27 @@ def _main(args):
             "--self-test to verify the tool without a database." % ENV_WORKSPACE
         )
 
+    # The wrong-database guard. It runs before the version table is read and
+    # before any delete, on every live path. A live --apply cannot run
+    # without it; an export under --apply writes only a file, so for it the
+    # flag is optional, and checked when given.
+    expected = args.expect_database
+    if expected is None:
+        if args.apply and args.export_versions is None:
+            raise ToolError(
+                "--apply needs --expect-database NAME, the exact name of the database the "
+                "connection must reach. Two connection files can sit side by side, and a "
+                "version delete runs against whichever one --workspace names. Nothing was "
+                "read and nothing was deleted.")
+        database = None
+    elif not _clean_text(expected):
+        raise ToolError("--expect-database must be a database name: not empty, no surrounding "
+                        "space, every character printable, got %r" % (redact(expected),))
+    else:
+        database = verify_database(workspace, expected)
+
     if args.export_versions is not None:
-        return run_export(args, workspace, now)
+        return run_export(args, workspace, now, database)
 
     deleter = make_deleter(workspace) if args.apply else None
 
@@ -2970,7 +3350,7 @@ def _main(args):
     )
 
     try:
-        print_plan(result, args, workspace, cutoff, applied=bool(args.apply))
+        print_plan(result, args, workspace, cutoff, applied=bool(args.apply), database=database)
         sys.stdout.flush()
     except OSError:
         # The deletes cannot be undone, and the report that names them is
