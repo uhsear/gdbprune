@@ -637,8 +637,9 @@ export writes the mark as `"replica": true`, so a plan from the snapshot holds b
 versions.
 
 To delete such a version, unregister its replica first. The version then drops off the list.
-For distributed collaboration, the same Esri page says that "no replica version is created when
-data is copied during distributed collaboration workflows".
+For distributed collaboration, the Offline maps and versioned data page linked above says that
+"no replica version is created when data is copied during distributed collaboration workflows".
+The ListReplicas, Replica and SyncReplica pages do not say this.
 
 The self-test pins this through the stand-in arcpy. Its `ListReplicas` returns
 `gisowner.crew_FieldSync_1404578882000` and `sde.Esri_Anonymous_WaterSync`, named like two
@@ -1091,6 +1092,20 @@ Real refusals, not a wishlist.
     - A value that mixes a `KEY=value` pair with extra text after a semicolon is masked only up
       to the semicolon.
     - The 3.9 and 3.10 runs used uv-managed interpreters, not the py launcher.
+    - The columns read from `sde.SDE_versions` (name, parent_name, owner, creation_time) come from
+      older Esri documentation and a stand-in, not from a current Esri column listing.
+    - The owner-qualified version name passed to `DeleteVersion`, including the quoted
+      domain-owner form, was not checked against Esri documentation or a real geodatabase.
+    - The real-arcpy checks need a signed-in ArcGIS Pro licence and were not repeated for each
+      release.
+    - The tool has no network path, so no local `http.server` stub is used.
+    - A connection-string workspace given with `--workspace` or `SDE_MAINTENANCE_WORKSPACE` puts
+      its password in the process arguments or the environment, where other local users can
+      read it. Use an `.sde` file.
+    - Error text is masked only in the forms listed above. A message that echoes a password
+      after another word, such as `sde_admin/hunter2` or `with pass hunter2`, prints as it came.
+    - When every candidate delete is refused, the report prints `nothing to prune.` above the
+      failure count. The exit code is `1`, so the verdict is right and the wording is not.
 
 ## Contributing
 
