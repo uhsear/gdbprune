@@ -226,7 +226,7 @@ on Ubuntu. 3.9 and 3.12 ran with `-W error`. On Ubuntu the same count also passe
 `TZ` settings: UTC, UTC-11 and UTC+14. The time-zone assertions use an offset that no zone
 uses. One assertion writes through a dangling symbolic link. On a Windows host that cannot
 create one (no Developer Mode, no admin rights), it prints a `SKIP` line instead, and the count
-is 372. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
+is 375. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
 a host that can create the link never runs it. Branch coverage was measured at 100% on Windows
 (1516 statements, 230 branches). On Ubuntu, a virtual environment that holds `coverage` also
 measured 100% branch coverage with 376 assertions. `pyflakes` reports nothing on both hosts, in
@@ -965,6 +965,17 @@ Real refusals, not a wishlist.
       overwrites the snapshot that the link points to.
     - If `--from-versions` names a FIFO or a device, the read can block. The reader loads the
       whole file into memory, however large it is.
+    - A live version name that contains a line break is matched by a different rule than SQL
+      `LIKE` uses. A trailing line break is ignored, and an inner one stops `%` from matching.
+      The plan prints such a name as it is, so it can make the plan text look like it has extra
+      lines.
+    - Only `%` and `_` are wildcards in `--prune-pattern`. A bracket set such as `[abc]` is
+      matched literally, although the printed candidate rule looks like SQL `LIKE`.
+    - A version name that contains a dot is reduced to its last dotted part for the leaf and
+      reserved-name checks, so two names can share one node. The failure direction is a kept
+      version, never a wrong delete.
+    - A connection-string `--workspace` can also be stored in ArcGIS Pro's geoprocessing
+      history. Use an `.sde` file.
     - A live version name made only of spaces is read as an empty name. A live plan never
       prunes it, and `--export-versions` refuses the whole table with exit `2`, because the
       snapshot would not read back.
@@ -1032,8 +1043,10 @@ Real refusals, not a wishlist.
       examples, not a complete list, so a platform with another spelling is refused.
     - The two Esri links in this README answer with a 301 redirect from `pro.arcgis.com` to
       `doc.esri.com`. They still resolve. The quoted text matched the redirected pages.
-    - Pressing Ctrl-C during `--apply` stops the run with a traceback and exit `130`. It prints
-      no list of the versions already deleted. Run a plan afterwards to see what remains.
+    - Pressing Ctrl-C during `--apply` stops the run with a traceback and a non-zero exit. The
+      code is `130` on Linux and under Git Bash, and a native Windows console can report
+      another code. The self-test does not exercise it. It prints no list of the versions
+      already deleted. Run a plan afterwards to see what remains.
     - The name is checked once, before the first read. Each delete then opens the connection
       file again through `arcpy.management.DeleteVersion`. A connection file that is replaced
       during the run is not caught.
@@ -1047,11 +1060,11 @@ Real refusals, not a wishlist.
       against Esri and Microsoft pages and the stand-in arcpy.
     - A database name with surrounding space or an unprintable character cannot be matched, so
       `--apply` always refuses it and deletes nothing.
-    - The `ListReplicas` quote on the replica pages is cut off in the fetched excerpt, so its
-      full wording is unverified. Esri's pages for the `Replica` and `SyncReplica` classes
-      returned 404, so gdbprune reads `.version` on each item without a documented guarantee.
-      A replica object without that attribute makes a live run exit `1` before it deletes
-      anything.
+    - Esri's [SyncReplica](https://doc.esri.com/en/arcgis-pro/latest/arcpy/data-access/syncreplica.html)
+      page lists a read-only `version` property, "The version from which the replica was
+      created." The `ListReplicas` page says `all_replicas=True` returns "All replica types
+      ... This may include Replica or SyncReplica objects." A replica object without that
+      attribute makes a live run exit `1` before it deletes anything.
     - The example snapshot behind the `--from-versions` plan above is described, not shipped, and
       the self-test uses different fixtures. A reader cannot rebuild its numbers from the four
       files alone.
