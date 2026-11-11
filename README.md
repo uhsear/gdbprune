@@ -1106,6 +1106,18 @@ Real refusals, not a wishlist.
       after another word, such as `sde_admin/hunter2` or `with pass hunter2`, prints as it came.
     - When every candidate delete is refused, the report prints `nothing to prune.` above the
       failure count. The exit code is `1`, so the verdict is right and the wording is not.
+    - The table row for `--apply --expect-database NAME` means a database named `NAME`, checked once
+      before the first read. It does not mean a server or an instance.
+    - Without a signed-in ArcGIS Pro licence, the real arcpy stops with `RuntimeError: The Product
+      License has not been initialized` instead of the workspace refusal described in item 10.
+    - A snapshot refusal can quote a field name from the file, never a field value.
+    - Legacy direct-connect text such as `-u sde -p hunter2` or `pass: hunter2` in a database
+      error prints as it came, like the other forms listed above.
+    - A database error such as a `pg_hba.conf` or `Login failed for user` message prints its host,
+      account and database names. They are names, not passwords, and they are not masked.
+    - An empty `--workspace ""`, such as an unset wrapper variable, falls back to
+      `SDE_MAINTENANCE_WORKSPACE`. A live `--apply` still needs `--expect-database`, but a plan
+      or an export reads whatever database the environment variable names.
 
 ## Contributing
 
