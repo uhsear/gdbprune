@@ -434,7 +434,7 @@ Esri documents what `ArcSDESQLExecute.execute` returns
 a list of lists for a statement that returns rows, and `True` or `False` for a statement that
 does not. It adds: "Statements that return a single value from a single row will return the
 value in an appropriate type". gdbprune accepts the bare value, a one-element row and a
-one-row table. It refuses every other result as "no database name": `False`, `True`, `None`,
+one-row table. It refuses every other result with "cannot read the database name": `False`, `True`, `None`,
 an empty list, two columns, two rows, a number, and text with a leading or trailing space or
 an unprintable character.
 
@@ -1041,8 +1041,10 @@ Real refusals, not a wishlist.
     - Oracle and Db2 geodatabases cannot run `--apply` with this release, because only
       `sqlserver` and `postgresql` have a name query. Esri lists the `dbClient` values as
       examples, not a complete list, so a platform with another spelling is refused.
-    - The two Esri links in this README answer with a 301 redirect from `pro.arcgis.com` to
-      `doc.esri.com`. They still resolve. The quoted text matched the redirected pages.
+    - Four of the five `pro.arcgis.com` links in this README answer with a 301 redirect to
+      `doc.esri.com`: ArcSDESQLExecute, Replica, Workspace properties and Delete a traditional
+      version. The Synchronization and versioning link answers 200. All five resolve. The quoted
+      text matched the redirected pages.
     - Pressing Ctrl-C during `--apply` stops the run with a traceback and a non-zero exit. The
       code is `130` on Linux and under Git Bash, and a native Windows console can report
       another code. The self-test does not exercise it. It prints no list of the versions
@@ -1083,8 +1085,12 @@ Real refusals, not a wishlist.
     - The snapshot file does not record which database it came from. A plan from an old
       snapshot of the wrong database is not caught. It cannot delete, so this costs a wrong
       reading, not a wrong delete.
-    - `--prune-days`, `--prune-pattern` and `--only-versions` are validated before the guard
-      runs. A bad value refuses the run before the database is touched, as it did before.
+    - `--prune-days` and `--prune-pattern` are validated before the guard runs. A bad value
+      refuses the run before the database is touched, as it did before. `--only-versions` is
+      only split and stripped, never validated.
+    - A value that mixes a `KEY=value` pair with extra text after a semicolon is masked only up
+      to the semicolon.
+    - The 3.9 and 3.10 runs used uv-managed interpreters, not the py launcher.
 
 ## Contributing
 
