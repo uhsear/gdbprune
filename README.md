@@ -21,10 +21,12 @@ repeats until a pass finds nothing. It never deletes a version that `arcpy.da.Li
 names as a registered replica's version. It never deletes a `SYNC_SEND` or `SYNC_RECEIVE`
 version unless you name a flag. Without `--apply` it prints the plan and deletes nothing.
 
-**It refuses to delete from the wrong database.** A live `--apply` needs
+**It refuses to delete unless the connected database name matches.** A live `--apply` needs
 `--expect-database NAME`. Before gdbprune reads the version table or deletes anything, it asks
 the server for the name of the database it is connected to. It refuses, with exit `1`, unless
-that name equals `NAME`. See [The wrong-database guard](#the-wrong-database-guard).
+that name equals `NAME`. It checks the name only, not the server. A restored copy on another
+server that keeps the same database name passes. Give the two databases different names. See
+[The wrong-database guard](#the-wrong-database-guard).
 
 **Who this is for.** A paid ArcGIS Enterprise install, a **traditionally-versioned**
 geodatabase, and an admin `.sde` connection file. Branch-versioned shops get nothing
@@ -399,7 +401,9 @@ the plan is the same, and the exit code is `0`. Nothing in the plan said which d
 read, so nothing could say it was the wrong one. The versions that go are production's, in the
 middle of a field week.
 
-A live `--apply` therefore needs `--expect-database NAME`. Before it reads the version table
+A live `--apply` therefore needs `--expect-database NAME`. The guard checks the database
+name, not the server. If the test copy keeps the production name, the guard cannot tell them
+apart, so give each database its own name. Before it reads the version table
 or deletes anything, gdbprune does this:
 
 1. It asks arcpy what kind of database the connection is. `arcpy.Describe(workspace)`
@@ -1013,7 +1017,18 @@ Real refusals, not a wishlist.
       `--expect-database` first.
     - A database name is not unique across servers. A production server and a test server can
       each hold a database named `GIS`, and the guard passes both. It proves the name, not the
-      host. Give the two databases different names, or check the host in the connection file.
+      server or instance. Esri's `connectionProperties` also has an `instance` property, and
+      gdbprune does not read it. Give the two databases different names, or check the host in
+      the connection file.
+    - The repository already had this guard when this round started (version 1.4.0). A live
+      `--apply` without `--expect-database` is refused before anything is read.
+    - Oracle and Db2 geodatabases cannot run `--apply` with this release, because only
+      `sqlserver` and `postgresql` have a name query. Esri lists the `dbClient` values as
+      examples, not a complete list, so a platform with another spelling is refused.
+    - The two Esri links in this README answer with a 301 redirect from `pro.arcgis.com` to
+      `doc.esri.com`. They still resolve. The quoted text matched the redirected pages.
+    - Pressing Ctrl-C during `--apply` stops the run with a traceback and exit `130`. It prints
+      no list of the versions already deleted. Run a plan afterwards to see what remains.
     - The name is checked once, before the first read. Each delete then opens the connection
       file again through `arcpy.management.DeleteVersion`. A connection file that is replaced
       during the run is not caught.
