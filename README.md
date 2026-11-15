@@ -386,7 +386,9 @@ traceback, which could quote the connection string.
 
 Everything gdbprune itself reports is escaped to ASCII: plans, errors and names. A version
 named with the CJK character U+4E2D prints as `SYNC_\u4e2d`, so no name can crash the report,
-even on a Windows stdout redirected to a file. argparse's own usage errors are the exception:
+even on a Windows stdout redirected to a file. ASCII control characters print as `\xNN` (ESC as
+`\x1b`, a line feed as `\x0a`), and bidi controls and zero-width characters print as `\uNNNN`, so
+a name cannot forge a report line. argparse's own usage errors are the exception:
 they echo a bad argument as typed, except that a connection string in one is redacted. The
 values of a connection-string workspace are hidden:
 `SERVER=***;USER=***;PASSWORD=***`. A value in braces or quotes can itself hold a `;`, as in
