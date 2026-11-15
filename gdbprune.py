@@ -941,8 +941,13 @@ def _say(text, stream=None):
     database errors can hold any character, and a stdout redirected to a
     file on Windows encodes cp1252 strictly: one such name used to crash the
     report of an --apply run AFTER its deletes. Escaping to ASCII here means
-    no text can do that, on any console or code page."""
-    print(text.encode("ascii", "backslashreplace").decode("ascii"), file=stream or sys.stdout)
+    no text can do that, on any console or code page. The same escape covers
+    ASCII controls (ESC, CR, LF, BEL, DEL), so a name cannot forge a report
+    line or rewrite the terminal. Every non-ASCII character, bidi controls
+    and zero-width characters included, is already escaped by the encode."""
+    text = text.encode("ascii", "backslashreplace").decode("ascii")
+    text = "".join("\\x%02x" % ord(c) if ord(c) < 32 or ord(c) == 127 else c for c in text)
+    print(text, file=stream or sys.stdout)
 
 
 def _mute_stdout():
@@ -2196,6 +2201,12 @@ def self_test():
         check(code == 0 and '"DOMAIN\\\\u0141ukasz".SYNC_\\u4e2d' in out
               and "1 version(s) would be deleted" in out,
               "a non-cp1252 name prints escaped to a cp1252 stdout, not a crash  <-- pinned defect")
+        hostile = io.StringIO()
+        _say("name: ok\x1b[2K\rFAKE‮⁦​﻿\x07\x7f\nforged", hostile)
+        check(hostile.getvalue() == "name: ok\\x1b[2K\\x0dFAKE\\u202e\\u2066\\u200b\\ufeff"
+              "\\x07\\x7f\\x0aforged\n",
+              "a name with ESC, CR, LF, bidi and zero-width characters prints escaped,"
+              " never raw  <-- pinned defect")
 
         # --export-versions: arcpy, writes only under --apply
         out_path = os.path.join(tmp, "export.json")

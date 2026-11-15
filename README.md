@@ -189,10 +189,10 @@ PASS  a stand-in arcpy is removed afterwards, and a nested one restores the oute
 PASS  check(), raises() and refuses() really do record a failure  <-- pinned defect
 PASS  a failed assertion makes the self-test exit 1 and names it  <-- pinned defect
 ------------------------------------------------------------------
-376 assertions, 0 failed
+377 assertions, 0 failed
 ```
 
-The full run prints all 376 assertions. The `...` lines are where this block is cut. It takes
+The full run prints all 377 assertions. The `...` lines are where this block is cut. It takes
 about 0.3 s on plain CPython 3.13 with no arcpy installed, and exits 0.
 
 ## Requirements
@@ -220,7 +220,7 @@ For the arcpy modes, use ArcGIS Pro's Python:
 arcpy is imported inside the functions that touch a geodatabase, never at module scope, so
 `--from-versions` and `--self-test` run on any Python 3.9 or newer, on Windows or Linux.
 
-The same 376 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
+The same 377 assertions pass on each interpreter it has been run on for 1.4.0: CPython 3.13.2,
 3.12.10, 3.10.20 and 3.9.25 on Windows, ArcGIS Pro's Python 3.13.7 on Windows, and CPython 3.12.3
 on Ubuntu. 3.9 and 3.12 ran with `-W error`. On Ubuntu the same count also passes under three
 `TZ` settings: UTC, UTC-11 and UTC+14. The time-zone assertions use an offset that no zone
@@ -229,7 +229,7 @@ create one (no Developer Mode, no admin rights), it prints a `SKIP` line instead
 is 375. Branch coverage excludes that `SKIP` branch with a `pragma: no cover` comment, because
 a host that can create the link never runs it. Branch coverage was measured at 100% on Windows
 (1516 statements, 230 branches). On Ubuntu, a virtual environment that holds `coverage` also
-measured 100% branch coverage with 376 assertions. `pyflakes` reports nothing on both hosts, in
+measured 100% branch coverage with 377 assertions. `pyflakes` reports nothing on both hosts, in
 that same virtual environment, because system `python3` on Ubuntu has no `pyflakes` or `coverage`
 module. `python -W error` compiles the file without a warning.
 
@@ -925,9 +925,6 @@ Real refusals, not a wishlist.
       that comparison yourself, then name only the orphans in `--only-versions`.
     - `ListReplicas` runs on every read of the version table, so a slow call is paid once per
       pass.
-    - A version name from a live database is printed as it is, control characters included.
-      A name that holds a terminal escape sequence reaches the console raw. The snapshot
-      reader refuses such a name.
     - On Oracle the version table is `SDE.VERSIONS`, not `sde.SDE_versions`, so the default
       `VERSION_TABLE` query is expected to fail there with exit `1`. No Oracle geodatabase was
       tested. A SQL Server geodatabase in the `dbo` schema keeps the table as
