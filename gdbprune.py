@@ -1056,25 +1056,20 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
         _say("")
 
     if result.error is not None:
-        _say(
-            "  STOPPED: re-reading the version table after pass %d failed, so the\n"
-            "  versions listed above were deleted and the rest were not tried.\n"
-            "      %s: %s"
-            % (len(result.passes), type(result.error).__name__, redact(str(result.error)))
-        )
+        _say("  STOPPED: re-reading the version table after pass %d failed, so the"
+             % len(result.passes))
+        _say("  versions listed above were deleted and the rest were not tried.")
+        _say("      %s: %s" % (type(result.error).__name__, redact(str(result.error))))
         _say("")
     elif not result.converged:
-        _say(
-            "  INCOMPLETE: stopped at the %d-pass limit with work still\n"
-            "  outstanding. Re-run to continue, or raise MAX_PASSES." % MAX_PASSES
-        )
+        _say("  INCOMPLETE: stopped at the %d-pass limit with work still" % MAX_PASSES)
+        _say("  outstanding. Re-run to continue, or raise MAX_PASSES.")
         _say("")
 
     if result.undated:
-        _say(
-            "  UNDATED: %d matching version(s) have no readable creation time, so\n"
-            "  they were not assessed. The run exits 1." % result.undated
-        )
+        _say("  UNDATED: %d matching version(s) have no readable creation time, so"
+             % result.undated)
+        _say("  they were not assessed. The run exits 1.")
         _say("")
 
     verb = "deleted" if applied else "would be deleted"
@@ -1083,8 +1078,8 @@ def print_plan(result, args, workspace, cutoff, applied, exported_at=None, now=N
             "  %d version(s) %s across %d pass(es), per the snapshot exported at %s."
             % (total, verb, len(result.passes), format_stamp(exported_at))
         )
-        _say("  A snapshot deletes nothing. To act on this plan, run against the live\n"
-              "  workspace, which re-reads the version table first.")
+        _say("  A snapshot deletes nothing. To act on this plan, run against the live")
+        _say("  workspace, which re-reads the version table first.")
     else:
         _say(
             "  %d version(s) %s across %d pass(es)."
@@ -2207,6 +2202,11 @@ def self_test():
               "\\x07\\x7f\\x0aforged\n",
               "a name with ESC, CR, LF, bidi and zero-width characters prints escaped,"
               " never raw  <-- pinned defect")
+        code, out = _run_cli(["--from-versions", snap_path], None)
+        check(code == 0 and "\\x0a" not in out
+              and "run against the live\n  workspace, which re-reads" in out,
+              "the snapshot note prints as two lines, not one line with an escaped LF"
+              "  <-- pinned defect")
 
         # --export-versions: arcpy, writes only under --apply
         out_path = os.path.join(tmp, "export.json")
